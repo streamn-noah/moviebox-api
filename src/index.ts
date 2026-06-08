@@ -172,18 +172,30 @@ async function handleSeason(subjectId: string): Promise<Response> {
     PATHS.seasonInfo, 'GET', { subjectId }
   );
 
-  if (!data) return json({ seasons: [] });
+  if (!data?.seasons?.length) return json({ seasons: [] });
 
   return json({
-    seasons: (data.seasons || []).map((s) => ({
-      season:       s.season,
-      totalEpisode: s.totalEpisode ?? 0,
-      episodes:     (s.episodes || []).map((ep) => ({
-        episode:     ep.episode,
-        title:       ep.title ?? null,
-        releaseDate: ep.releaseDate ?? null,
-      })),
-    })),
+    seasons: data.seasons.map((s) => {
+      // Build episode list from maxEp count — API doesn't return per-episode metadata
+      const episodes = Array.from({ length: s.maxEp }, (_, i) => ({
+        episode:     i + 1,
+        title:       null,
+        releaseDate: null,
+      }));
+
+      // Best available episode count = highest resolution's epNum
+      const bestEpCount = s.resolutions?.length
+        ? Math.max(...s.resolutions.map((r) => r.epNum))
+        : s.maxEp;
+
+      return {
+        season:            s.se,
+        totalEpisode:      s.maxEp,
+        episodesAvailable: bestEpCount,
+        resolutions:       s.resolutions || [],
+        episodes,
+      };
+    }),
   });
 }
 

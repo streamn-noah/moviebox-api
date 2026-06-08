@@ -197,10 +197,14 @@ export interface MBDetailData {
 }
 
 export interface MBSeasonData {
+  subjectId?:  string;
+  subjectType?: number;
+  // Season number → se, episode count → maxEp, resolutions show per-quality ep counts
   seasons?: Array<{
-    season:        number;
-    totalEpisode?: number;
-    episodes?:     Array<{ episode: number; title?: string; releaseDate?: string }>;
+    se:           number;
+    maxEp:        number;
+    allEp?:       string;
+    resolutions?: Array<{ resolution: number; epNum: number }>;
   }>;
 }
 
