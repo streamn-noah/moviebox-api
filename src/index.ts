@@ -119,31 +119,47 @@ async function handleSearch(request: Request): Promise<Response> {
 }
 
 async function handleInfo(subjectId: string): Promise<Response> {
-  const data = await fetchWithHostPool<MBDetailData>(
+  // Response is flat — the subject fields are returned directly as `data`,
+  // not nested under `data.subject`. staffList is also at the top level.
+  const data = await fetchWithHostPool<MBDetailData & MBDetailData['subject']>(
     PATHS.get, 'GET', { subjectId }
   );
 
-  if (!data?.subject) return err('Not found', 404);
+  if (!data?.subjectId) return err('Not found', 404);
 
-  const { subject, staffList } = data;
+  // staffList may be at top level or inside a subject wrapper — handle both
+  const staffList = (data as any).staffList || [];
+
+  // duration comes back as "2h 42m" string in some responses — convert to minutes
+  const rawDuration = (data as any).duration;
+  let runtimeMinutes: number | null = null;
+  if (typeof rawDuration === 'number') {
+    runtimeMinutes = Math.round(rawDuration / 60);
+  } else if (typeof rawDuration === 'string') {
+    const hMatch = rawDuration.match(/(\d+)h/);
+    const mMatch = rawDuration.match(/(\d+)m/);
+    const h = hMatch ? parseInt(hMatch[1]) : 0;
+    const m = mMatch ? parseInt(mMatch[1]) : 0;
+    runtimeMinutes = h * 60 + m || null;
+  }
 
   return json({
-    subjectId:   subject.subjectId,
-    subjectType: subject.subjectType,
-    type:        subject.subjectType === 2 ? 'tv' : 'movie',
-    title:       subject.title,
-    description: subject.description ?? '',
-    releaseDate: subject.releaseDate ?? null,
-    runtime:     subject.duration ? Math.round(subject.duration / 60) : null,
-    genre:       subject.genre ?? null,
-    poster:      subject.cover?.url ?? null,
-    country:     subject.countryName ?? null,
-    rating:      subject.imdbRatingValue && subject.imdbRatingValue !== '0'
-                   ? parseFloat(subject.imdbRatingValue)
+    subjectId:   data.subjectId,
+    subjectType: data.subjectType,
+    type:        data.subjectType === 2 ? 'tv' : 'movie',
+    title:       data.title,
+    description: data.description ?? '',
+    releaseDate: data.releaseDate ?? null,
+    runtime:     runtimeMinutes,
+    genre:       data.genre ?? null,
+    poster:      data.cover?.url ?? null,
+    country:     data.countryName ?? null,
+    rating:      data.imdbRatingValue && data.imdbRatingValue !== '0'
+                   ? parseFloat(data.imdbRatingValue)
                    : null,
-    hasResource: subject.hasResource ?? false,
-    language:    subject.language ?? null,
-    staff:       (staffList || []).map((s) => ({
+    hasResource: data.hasResource ?? false,
+    language:    data.language ?? null,
+    staff:       staffList.map((s: any) => ({
       name:   s.name,
       role:   s.role,
       avatar: s.avatar?.url ?? null,
