@@ -40,37 +40,43 @@ export const PATHS = {
 };
 
 // ─── Client identity ──────────────────────────────────────────────────────────
+// Generated inside request handlers only — Cloudflare Workers forbid crypto
+// calls (getRandomValues, randomUUID) in the global/module scope.
 
 function makeClientInfo(): string {
-  // Workers don't have crypto.randomUUID in older compat dates — use built-in
   const deviceId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
   const gaid = crypto.randomUUID();
 
   return JSON.stringify({
-    package_name:  'com.community.oneroom',
-    version_name:  VERSION_NAME,
-    version_code:  VERSION_CODE,
-    os:            'android',
-    os_version:    ANDROID_VERSION,
-    install_ch:    'ps',
-    device_id:     deviceId,
-    install_store: 'ps',
+    package_name:    'com.community.oneroom',
+    version_name:    VERSION_NAME,
+    version_code:    VERSION_CODE,
+    os:              'android',
+    os_version:      ANDROID_VERSION,
+    install_ch:      'ps',
+    device_id:       deviceId,
+    install_store:   'ps',
     gaid,
-    brand:         DEVICE_BRAND,
-    model:         DEVICE_MODEL,
+    brand:           DEVICE_BRAND,
+    model:           DEVICE_MODEL,
     system_language: 'en',
-    net:           'NETWORK_WIFI',
-    region:        'US',
-    timezone:      'America/New_York',
-    sp_code:       '40401',
-    'X-Play-Mode': '2',
+    net:             'NETWORK_WIFI',
+    region:          'US',
+    timezone:        'America/New_York',
+    sp_code:         '40401',
+    'X-Play-Mode':   '2',
   });
 }
 
-// Generated once per Worker instance (cold start)
-const CLIENT_INFO = makeClientInfo();
+// Lazily cached per isolate lifetime — set on first request, reused after.
+// Never called at module load time so global scope restriction is not triggered.
+let _clientInfo: string | null = null;
+function getClientInfo(): string {
+  if (!_clientInfo) _clientInfo = makeClientInfo();
+  return _clientInfo;
+}
 
 // ─── Signed headers builder ───────────────────────────────────────────────────
 
@@ -95,7 +101,7 @@ async function buildHeaders(
     'Connection':      'keep-alive',
     'X-Client-Token':  token,
     'x-tr-signature':  signature,
-    'X-Client-Info':   CLIENT_INFO,
+    'X-Client-Info':   getClientInfo(),
     'X-Client-Status': '0',
     'X-Play-Mode':     '2',
   };
