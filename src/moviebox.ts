@@ -180,21 +180,20 @@ export interface MBSearchData {
 }
 
 export interface MBDetailData {
-  subject: {
-    subjectId:        string;
-    subjectType:      number;
-    title:            string;
-    description?:     string;
-    releaseDate?:     string;
-    duration?:        number;
-    genre?:           string;
-    cover?:           { url: string };
-    countryName?:     string;
-    imdbRatingValue?: string;
-    hasResource?:     boolean;
-    language?:        string;
-  };
-  staffList?: Array<{ name: string; role: string; avatar?: { url?: string } }>;
+  // Response is flat — all fields at top level, no subject wrapper
+  subjectId:        string;
+  subjectType:      number;
+  title:            string;
+  description?:     string;
+  releaseDate?:     string;
+  duration?:        number | string;  // "2h 42m" string or seconds number
+  genre?:           string;
+  cover?:           { url: string };
+  countryName?:     string;
+  imdbRatingValue?: string;
+  hasResource?:     boolean;
+  language?:        string;
+  staffList?:       Array<{ name: string; role: string; avatar?: { url?: string } }>;
 }
 
 export interface MBSeasonData {
