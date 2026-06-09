@@ -221,25 +221,35 @@ async function handleStream(subjectId: string, se: number, ep: number): Promise<
 }
 
 async function handleDownload(subjectId: string, se: number, ep: number): Promise<Response> {
+  // Always fetch the full episode pack (se=0&ep=0) — MovieBox returns all episodes
+  // in one response. We then filter by the requested se/ep values.
   const data = await fetchWithHostPool<MBResourceData>(
-    PATHS.resource, 'GET', { subjectId, se, ep }
+    PATHS.resource, 'GET', { subjectId, se: 0, ep: 0 }
   );
 
   if (!data?.list?.length) return err('No downloads available', 404);
 
-  // Only return free content
-  const free = data.list.filter((r) => (r.requireMemberType ?? 0) === 0);
-  if (!free.length) return err('No free downloads available', 404);
+  // Filter to only free content
+  let items = data.list.filter((r) => (r.requireMemberType ?? 0) === 0);
+  if (!items.length) return err('No free downloads available', 404);
+
+  // Filter by requested se/ep when specific episode requested
+  // se=0&ep=0 means "get all" (used for movies), otherwise filter to specific episode
+  const isSpecificEpisode = se !== 0 || ep !== 0;
+  if (isSpecificEpisode) {
+    const episodeItems = items.filter((r) => r.se === se && r.ep === ep);
+    // Fall back to full list if no match found for that episode
+    if (episodeItems.length) items = episodeItems;
+  }
 
   // Sort best quality first
-  const sorted = [...free].sort((a, b) => b.resolution - a.resolution);
+  const sorted = [...items].sort((a, b) => b.resolution - a.resolution);
 
   const downloads = sorted.map((item: MBResourceItem) => {
     const sizeMb = item.size
       ? `${Math.round(parseInt(item.size) / (1024 * 1024))} MB`
       : null;
 
-    // Extract captions
     const captions = (item.extCaptions || []).map((cap) => ({
       language:      cap.lanName || LANGUAGE_NAMES[cap.lan] || cap.lan,
       language_code: cap.lan,
