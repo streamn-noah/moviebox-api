@@ -22,6 +22,15 @@ import {
   type MBResourceItem,
 } from './moviebox.js';
 
+// subjectType: 1=movie, 2=tv, 7=shorts — 5,6,8 filtered out
+const ALLOWED_SUBJECT_TYPES = new Set([1, 2, 7]);
+
+function resolveSubjectType(subjectType: number): 'movie' | 'tv' | 'shorts' {
+  if (subjectType === 2) return 'tv';
+  if (subjectType === 7) return 'shorts';
+  return 'movie';
+}
+
 export interface Env {
   MOVIEBOX_SECRET: string;
 }
@@ -143,7 +152,9 @@ async function handleSearch(request: Request): Promise<Response> {
 
   if (!data) return json({ items: [], pager: null });
 
-  const items = (data.items || []).map((item) => ({
+  const items = (data.items || [])
+    .filter((item) => ALLOWED_SUBJECT_TYPES.has(item.subjectType))
+    .map((item) => ({
     subjectId:   item.subjectId,
     subjectType: item.subjectType,
     title:       item.title,
@@ -158,7 +169,7 @@ async function handleSearch(request: Request): Promise<Response> {
                    ? parseFloat(item.imdbRatingValue)
                    : null,
     language:    item.language ?? null,
-    type:        item.subjectType === 2 ? 'tv' : 'movie',
+    type:        resolveSubjectType(item.subjectType),
   }));
 
   return json({ items, pager: data.pager });
@@ -188,7 +199,7 @@ async function handleInfo(subjectId: string): Promise<Response> {
   return json({
     subjectId:   data.subjectId,
     subjectType: data.subjectType,
-    type:        data.subjectType === 2 ? 'tv' : 'movie',
+    type:        resolveSubjectType(data.subjectType),
     title:       data.title,
     description: data.description ?? '',
     releaseDate: data.releaseDate ?? null,
