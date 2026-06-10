@@ -5,9 +5,12 @@
 //   POST /search              { keyword, page?, perPage? }
 //   GET  /info/:subjectId
 //   GET  /season/:subjectId
-//   GET  /stream/:subjectId   ?se=0&ep=0
-//   GET  /download/:subjectId ?se=0&ep=0
+//   GET  /stream/:subjectId   ?se=X&ep=Y  — returns MP4 URLs for specific episode
+//   GET  /download/:subjectId             — returns full pack grouped by season/episode
 //   GET  /health
+//
+// /stream and /download both use the /resource endpoint (direct MP4 links).
+// The old DASH /play-info endpoint is no longer used.
 
 import {
   fetchWithHostPool,
@@ -15,18 +18,15 @@ import {
   type MBSearchData,
   type MBDetailData,
   type MBSeasonData,
-  type MBPlayInfoData,
   type MBResourceData,
   type MBResourceItem,
 } from './moviebox.js';
-
-// ─── Env bindings ─────────────────────────────────────────────────────────────
 
 export interface Env {
   MOVIEBOX_SECRET: string;
 }
 
-// ─── CORS / response helpers ──────────────────────────────────────────────────
+// ─── Response helpers ─────────────────────────────────────────────────────────
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -59,19 +59,48 @@ const LANGUAGE_NAMES: Record<string, string> = {
   pa: 'Punjabi',   fil: 'Filipino', id: 'Indonesian',
 };
 
-// ─── Cookie parser (for CloudFront signCookie) ────────────────────────────────
+// ─── Shared: fetch full resource pack ────────────────────────────────────────
+// Always fetches se=0&ep=0 which returns all episodes across all seasons.
+// Returns only free content, sorted best quality first.
 
-function parseCookies(cookieStr: string): Record<string, string> {
-  if (!cookieStr) return {};
-  const cookies: Record<string, string> = {};
-  for (const part of cookieStr.split(';')) {
-    const idx = part.indexOf('=');
-    if (idx === -1) continue;
-    const key = part.slice(0, idx).trim();
-    const val = part.slice(idx + 1).trim();
-    if (key) cookies[key] = val;
-  }
-  return cookies;
+async function fetchResourcePack(subjectId: string): Promise<MBResourceItem[] | null> {
+  const data = await fetchWithHostPool<MBResourceData>(
+    PATHS.resource, 'GET', { subjectId, se: 0, ep: 0 }
+  );
+
+  if (!data?.list?.length) return null;
+
+  const free = data.list.filter((r) => (r.requireMemberType ?? 0) === 0);
+  if (!free.length) return null;
+
+  return free.sort((a, b) => b.resolution - a.resolution);
+}
+
+// ─── Shared: map a resource item to a download object ────────────────────────
+
+function mapResourceItem(item: MBResourceItem) {
+  const sizeMb = item.size
+    ? `${Math.round(parseInt(item.size) / (1024 * 1024))} MB`
+    : null;
+
+  const captions = (item.extCaptions || []).map((cap) => ({
+    language:      cap.lanName || LANGUAGE_NAMES[cap.lan] || cap.lan,
+    language_code: cap.lan,
+    url:           cap.url,
+  }));
+
+  return {
+    quality:    `${item.resolution}p`,
+    resolution: item.resolution,
+    url:        item.resourceLink,
+    format:     'mp4' as const,
+    size:       sizeMb,
+    codecName:  item.codecName ?? null,
+    duration:   item.duration ?? null,
+    captions,
+    se:         item.se,
+    ep:         item.ep,
+  };
 }
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
@@ -99,7 +128,7 @@ async function handleSearch(request: Request): Promise<Response> {
 
   const items = (data.items || []).map((item) => ({
     subjectId:   item.subjectId,
-    subjectType: item.subjectType,   // 1 = movie, 2 = tv
+    subjectType: item.subjectType,
     title:       item.title,
     description: item.description ?? '',
     releaseDate: item.releaseDate ?? null,
@@ -119,18 +148,14 @@ async function handleSearch(request: Request): Promise<Response> {
 }
 
 async function handleInfo(subjectId: string): Promise<Response> {
-  // Response is flat — the subject fields are returned directly as `data`,
-  // not nested under `data.subject`. staffList is also at the top level.
-  const data = await fetchWithHostPool<MBDetailData & MBDetailData['subject']>(
+  const data = await fetchWithHostPool<MBDetailData>(
     PATHS.get, 'GET', { subjectId }
   );
 
   if (!data?.subjectId) return err('Not found', 404);
 
-  // staffList may be at top level or inside a subject wrapper — handle both
   const staffList = (data as any).staffList || [];
 
-  // duration comes back as "2h 42m" string in some responses — convert to minutes
   const rawDuration = (data as any).duration;
   let runtimeMinutes: number | null = null;
   if (typeof rawDuration === 'number') {
@@ -176,14 +201,12 @@ async function handleSeason(subjectId: string): Promise<Response> {
 
   return json({
     seasons: data.seasons.map((s) => {
-      // Build episode list from maxEp count — API doesn't return per-episode metadata
       const episodes = Array.from({ length: s.maxEp }, (_, i) => ({
         episode:     i + 1,
         title:       null,
         releaseDate: null,
       }));
 
-      // Best available episode count = highest resolution's epNum
       const bestEpCount = s.resolutions?.length
         ? Math.max(...s.resolutions.map((r) => r.epNum))
         : s.maxEp;
@@ -199,86 +222,87 @@ async function handleSeason(subjectId: string): Promise<Response> {
   });
 }
 
+// GET /stream/:subjectId?se=X&ep=Y
+// Fetches full resource pack, filters to the specific episode, deduplicates by quality.
+// Returns MP4 URLs — player picks quality.
+
 async function handleStream(subjectId: string, se: number, ep: number): Promise<Response> {
-  const data = await fetchWithHostPool<MBPlayInfoData>(
-    PATHS.playInfo, 'GET', { subjectId, se, ep }
-  );
+  const pack = await fetchResourcePack(subjectId);
+  if (!pack) return err('No streams available', 404);
 
-  if (!data?.streams?.length) return err('No streams available', 404);
+  // For movies se=0&ep=0 — return full pack as-is (single item per quality)
+  // For TV filter to the specific episode
+  const isMovie = se === 0 && ep === 0;
+  let items = pack;
 
-  const streams = data.streams.map((s) => ({
-    format:      s.format,
-    url:         s.url,
-    resolutions: s.resolutions ?? '',
-    size:        s.size ?? null,
-    duration:    s.duration ?? null,
-    codecName:   s.codecName ?? null,
-    // Parse CloudFront cookies so the frontend can attach them directly
-    cookies:     parseCookies(s.signCookie ?? ''),
-  }));
-
-  return json({ title: data.title ?? null, streams });
-}
-
-async function handleDownload(subjectId: string, se: number, ep: number): Promise<Response> {
-  // Always fetch the full episode pack (se=0&ep=0) — MovieBox returns all episodes
-  // in one response. We then filter by the requested se/ep values.
-  const data = await fetchWithHostPool<MBResourceData>(
-    PATHS.resource, 'GET', { subjectId, se: 0, ep: 0 }
-  );
-
-  if (!data?.list?.length) return err('No downloads available', 404);
-
-  // Filter to only free content
-  let items = data.list.filter((r) => (r.requireMemberType ?? 0) === 0);
-  if (!items.length) return err('No free downloads available', 404);
-
-  // Filter by requested se/ep when specific episode requested
-  // se=0&ep=0 means "get all" (used for movies), otherwise filter to specific episode
-  const isSpecificEpisode = se !== 0 || ep !== 0;
-  if (isSpecificEpisode) {
-    const episodeItems = items.filter((r) => r.se === se && r.ep === ep);
-    // Fall back to full list if no match found for that episode
-    if (episodeItems.length) items = episodeItems;
+  if (!isMovie) {
+    const filtered = pack.filter((r) => r.se === se && r.ep === ep);
+    if (!filtered.length) return err('No streams available for this episode', 404);
+    items = filtered;
   }
 
-  // Sort best quality first
-  const sorted = [...items].sort((a, b) => b.resolution - a.resolution);
+  // Deduplicate by quality — keep first (best encode per resolution)
+  const seenQualities = new Set<string>();
+  const streams = items
+    .filter((item) => {
+      const q = `${item.resolution}p`;
+      if (seenQualities.has(q)) return false;
+      seenQualities.add(q);
+      return true;
+    })
+    .map(mapResourceItem);
 
-  const downloads = sorted.map((item: MBResourceItem) => {
-    const sizeMb = item.size
-      ? `${Math.round(parseInt(item.size) / (1024 * 1024))} MB`
-      : null;
+  return json({ streams, total: streams.length });
+}
 
-    const captions = (item.extCaptions || []).map((cap) => ({
-      language:      cap.lanName || LANGUAGE_NAMES[cap.lan] || cap.lan,
-      language_code: cap.lan,
-      url:           cap.url,
+// GET /download/:subjectId
+// Returns full pack grouped by season → episodes → qualities.
+// No se/ep params — always returns everything available.
+
+async function handleDownload(subjectId: string): Promise<Response> {
+  const pack = await fetchResourcePack(subjectId);
+  if (!pack) return err('No downloads available', 404);
+
+  // Group by season (se) → episode (ep) → deduplicated qualities
+  const seasonMap = new Map<number, Map<number, ReturnType<typeof mapResourceItem>[]>>();
+
+  for (const item of pack) {
+    const seKey = item.se;
+    const epKey = item.ep;
+
+    if (!seasonMap.has(seKey)) seasonMap.set(seKey, new Map());
+    const episodeMap = seasonMap.get(seKey)!;
+
+    if (!episodeMap.has(epKey)) episodeMap.set(epKey, []);
+    const qualities = episodeMap.get(epKey)!;
+
+    // Deduplicate by quality within each episode
+    const q = `${item.resolution}p`;
+    if (!qualities.find((x) => x.quality === q)) {
+      qualities.push(mapResourceItem(item));
+    }
+  }
+
+  // Convert to Option B shape: seasons[] → episodes[] → qualities[]
+  const seasons = [...seasonMap.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([seasonNum, episodeMap]) => ({
+      season: seasonNum,
+      episodes: [...episodeMap.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([epNum, qualities]) => ({
+          episode:  epNum,
+          qualities,
+        })),
     }));
 
-    return {
-      quality:    `${item.resolution}p`,
-      resolution: item.resolution,
-      url:        item.resourceLink,
-      format:     'mp4',
-      size:       sizeMb,
-      codecName:  item.codecName ?? null,
-      duration:   item.duration ?? null,
-      captions,
-      episode:    item.episode,
-      se:         item.se,
-      ep:         item.ep,
-    };
-  });
-
-  return json({ downloads, total: downloads.length });
+  return json({ seasons, total_seasons: seasons.length });
 }
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // Handle CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -289,8 +313,7 @@ export default {
       });
     }
 
-    // Auth check on all non-health routes
-    const url = new URL(request.url);
+    const url  = new URL(request.url);
     const path = url.pathname;
 
     if (path === '/health') {
@@ -300,8 +323,6 @@ export default {
     if (!isAuthorized(request, env)) {
       return err('Unauthorized', 401);
     }
-
-    // ── Routes ──────────────────────────────────────────────────────────────
 
     // POST /search
     if (path === '/search' && request.method === 'POST') {
@@ -320,7 +341,7 @@ export default {
       return handleSeason(seasonMatch[1]);
     }
 
-    // GET /stream/:subjectId?se=0&ep=0
+    // GET /stream/:subjectId?se=X&ep=Y
     const streamMatch = path.match(/^\/stream\/([^/]+)$/);
     if (streamMatch && request.method === 'GET') {
       const se = parseInt(url.searchParams.get('se') ?? '0');
@@ -328,12 +349,10 @@ export default {
       return handleStream(streamMatch[1], se, ep);
     }
 
-    // GET /download/:subjectId?se=0&ep=0
+    // GET /download/:subjectId  (no se/ep — always full pack)
     const downloadMatch = path.match(/^\/download\/([^/]+)$/);
     if (downloadMatch && request.method === 'GET') {
-      const se = parseInt(url.searchParams.get('se') ?? '0');
-      const ep = parseInt(url.searchParams.get('ep') ?? '0');
-      return handleDownload(downloadMatch[1], se, ep);
+      return handleDownload(downloadMatch[1]);
     }
 
     return err('Not found', 404);
