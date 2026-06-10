@@ -59,21 +59,38 @@ const LANGUAGE_NAMES: Record<string, string> = {
   pa: 'Punjabi',   fil: 'Filipino', id: 'Indonesian',
 };
 
-// ─── Shared: fetch full resource pack ────────────────────────────────────────
-// Always fetches se=0&ep=0 which returns all episodes across all seasons.
-// Returns only free content, sorted best quality first.
+// ─── Shared: fetch full resource pack (all pages) ────────────────────────────
+// MovieBox paginates the resource endpoint. We fetch all pages until hasMore=false
+// to get every episode across all seasons for this subject.
 
 async function fetchResourcePack(subjectId: string): Promise<MBResourceItem[] | null> {
-  const data = await fetchWithHostPool<MBResourceData>(
-    PATHS.resource, 'GET', { subjectId, se: 0, ep: 0 }
-  );
+  const allItems: MBResourceItem[] = [];
+  let page = 1;
+  const perPage = 50; // max per page
 
-  if (!data?.list?.length) return null;
+  while (true) {
+    const data = await fetchWithHostPool<MBResourceData>(
+      PATHS.resource, 'GET', { subjectId, se: 0, ep: 0, page, perPage }
+    );
 
-  const free = data.list.filter((r) => (r.requireMemberType ?? 0) === 0);
-  if (!free.length) return null;
+    if (!data?.list?.length) break;
 
-  return free.sort((a, b) => b.resolution - a.resolution);
+    // Collect only free content
+    const free = data.list.filter((r) => (r.requireMemberType ?? 0) === 0);
+    allItems.push(...free);
+
+    // Stop if no more pages
+    if (!data.pager?.hasMore) break;
+
+    page++;
+
+    // Safety cap — never fetch more than 20 pages
+    if (page > 20) break;
+  }
+
+  if (!allItems.length) return null;
+
+  return allItems.sort((a, b) => b.resolution - a.resolution);
 }
 
 // ─── Shared: map a resource item to a download object ────────────────────────
