@@ -34,7 +34,6 @@ export const PATHS = {
   search:     '/wefeed-mobile-bff/subject-api/search',
   get:        '/wefeed-mobile-bff/subject-api/get',
   seasonInfo: '/wefeed-mobile-bff/subject-api/season-info',
-  playInfo:   '/wefeed-mobile-bff/subject-api/play-info',
   resource:   '/wefeed-mobile-bff/subject-api/resource',
   captions:   '/wefeed-mobile-bff/subject-api/get-ext-captions',
 };
@@ -206,22 +205,6 @@ export interface MBSeasonData {
     allEp?:       string;
     resolutions?: Array<{ resolution: number; epNum: number }>;
   }>;
-}
-
-export interface MBStream {
-  format:      string;
-  id:          string;
-  url:         string;
-  resolutions: string;
-  size?:       string;
-  duration?:   number;
-  codecName?:  string;
-  signCookie?: string;
-}
-
-export interface MBPlayInfoData {
-  streams: MBStream[];
-  title?:  string;
 }
 
 export interface MBResourceItem {
