@@ -224,6 +224,6 @@ export interface MBResourceItem {
 }
 
 export interface MBResourceData {
-  pager: { hasMore: boolean; totalCount: number };
+  pager: { hasMore: boolean; totalCount: number; nextPage?: string; page?: string; perPage?: number };
   list:  MBResourceItem[];
 }
