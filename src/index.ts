@@ -1,17 +1,20 @@
 // src/index.ts
-// MovieBox Worker — main entry point.
-// All routes are protected by X-Worker-Secret header.
+// Spün MovieBox Worker — main entry point.
 // Routes:
-//   POST /search              { keyword, page?, perPage? }
-//   GET  /info/:subjectId
-//   GET  /season/:subjectId
-//   GET  /stream/:subjectId   ?se=X&ep=Y  — returns MP4 URLs for specific episode
-//   GET  /download/:subjectId             — returns full pack grouped by season/episode
-//   GET  /home                ?page=1&tabId=0
-//   GET  /health
+//   GET  /                             — API info & route listing (public)
+//   GET  /health                       — health check (public)
+//   POST /search                       — { keyword, page?, perPage? }
+//   GET  /info/:subjectId              — subject detail
+//   GET  /season/:subjectId            — season/episode structure
+//   GET  /stream/:subjectId            — ?se=X&ep=Y  MP4 URLs for specific episode
+//   GET  /stream/:subjectId/all        — all episodes with streams (shorts/series bulk)
+//   GET  /download/:subjectId          — full pack grouped by season/episode
+//   GET  /home                         — homepage rows + subjects (Africa feed)
+//   GET  /home/subjects?opId=X         — subjects for a specific row
 //
-// /stream and /download both use the /resource endpoint (direct MP4 links).
-// The old DASH /play-info endpoint is no longer used.
+// /stream, /stream/all, and /download use the Android resource endpoint (7-host pool).
+// /home and /home/subjects use the H5 web endpoint (no HMAC signing required).
+// All routes except / and /health require X-Worker-Secret header.
 
 import {
   fetchWithHostPool,
@@ -21,11 +24,9 @@ import {
   type MBSeasonData,
   type MBResourceData,
   type MBResourceItem,
-  type MBHomeData,
-  type MBHomeRow,
 } from './moviebox.js';
 
-// subjectType: 1=movie, 2=tv, 7=shorts — 5,6,8 filtered out
+// subjectType: 1=movie, 2=tv, 7=shorts — all others filtered out
 const ALLOWED_SUBJECT_TYPES = new Set([1, 2, 7]);
 
 function resolveSubjectType(subjectType: number): 'movie' | 'tv' | 'shorts' {
@@ -73,16 +74,17 @@ const LANGUAGE_NAMES: Record<string, string> = {
 
 // ─── Shared: fetch full resource pack (all resolutions, all pages) ───────────
 // MovieBox's resource endpoint is resolution-filtered — omitting the resolution
-// param causes the server to return only one quality. We loop over every known
-// resolution and paginate each until hasMore=false, deduplicating by resourceId
-// across passes. se=0&ep=0 is the magic value that returns all episodes in bulk.
+// param returns only one quality. We loop over every known resolution and
+// paginate each until hasMore=false, deduplicating by resourceId across passes.
+// se=0&ep=0 is the magic value that returns all episodes in bulk.
+// perPage must be 10 — server silently rejects higher values with code !== 0.
 
 const RESOLUTIONS = [360, 480, 720, 1080];
 
 async function fetchResourcePack(subjectId: string): Promise<MBResourceItem[] | null> {
   const seenResourceIds = new Set<string>();
   const allItems: MBResourceItem[] = [];
-  const perPage = 10; // server silently rejects values above 10
+  const perPage = 10;
 
   for (const resolution of RESOLUTIONS) {
     let page = 1;
@@ -105,7 +107,7 @@ async function fetchResourcePack(subjectId: string): Promise<MBResourceItem[] | 
 
       page++;
 
-      // Safety cap — 100 pages x 50 items = 5000 items per resolution,
+      // Safety cap — 100 pages x 10 items = 1000 items per resolution,
       // enough for the longest series on MovieBox (e.g. One Piece ~1100 eps).
       if (page > 100) break;
     }
@@ -116,7 +118,7 @@ async function fetchResourcePack(subjectId: string): Promise<MBResourceItem[] | 
   return allItems.sort((a, b) => b.resolution - a.resolution);
 }
 
-// ─── Shared: map a resource item to a download object ────────────────────────
+// ─── Shared: map a resource item to a stream/download object ─────────────────
 
 function mapResourceItem(item: MBResourceItem) {
   const sizeMb = item.size
@@ -143,7 +145,126 @@ function mapResourceItem(item: MBResourceItem) {
   };
 }
 
+// ─── H5 homepage fetcher ──────────────────────────────────────────────────────
+// No HMAC signing needed — the H5 API only requires standard browser headers.
+// The Africa/Lagos timezone pin in X-Client-Info is what produces the Africa
+// region feed (Nollywood, Anime Dub, Black Shows rows). Do not change it.
+
+const H5_HOSTS = [
+  'https://h5.aoneroom.com',
+  'https://moviebox.pk',
+];
+
+const H5_PATH = '/wefeed-h5-bff/web/home';
+
+interface H5Subject {
+  subjectId:        string;
+  subjectType:      number;
+  title:            string;
+  description?:     string;
+  releaseDate?:     string;
+  duration?:        number;
+  genre?:           string;
+  cover?:           { url?: string; thumbnail?: string };
+  countryName?:     string;
+  imdbRatingValue?: string;
+  hasResource?:     boolean;
+  language?:        string;
+}
+
+interface H5Row {
+  title:    string;
+  opId:     string;
+  type:     string;
+  subjects: H5Subject[];
+}
+
+interface H5HomeData {
+  operatingList: H5Row[];
+}
+
+async function fetchH5Home(): Promise<H5HomeData | null> {
+  for (const base of H5_HOSTS) {
+    try {
+      const response = await fetch(`${base}${H5_PATH}`, {
+        method: 'GET',
+        headers: {
+          'X-Client-Info': '{"timezone":"Africa/Lagos"}',
+          'Accept':         'application/json',
+          'User-Agent':     'Mozilla/5.0 (X11; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0',
+          'Referer':        `${base}/`,
+        },
+        signal: AbortSignal.timeout(12000),
+      });
+
+      if (!response.ok) {
+        console.warn(`[H5] Host ${base} returned ${response.status} — trying next`);
+        continue;
+      }
+
+      const data = await response.json() as { code: number; data?: H5HomeData };
+
+      if (data.code === 0 && data.data) {
+        return data.data;
+      }
+
+      console.warn(`[H5] Host ${base} returned API code ${data.code} — trying next`);
+    } catch (e) {
+      console.warn(`[H5] Host ${base} failed: ${e} — trying next`);
+    }
+  }
+
+  console.error('[H5] All hosts exhausted');
+  return null;
+}
+
+function normalizeH5Subject(item: H5Subject) {
+  const rawDuration = item.duration;
+  const runtimeMinutes = rawDuration && rawDuration > 0
+    ? Math.round(rawDuration / 60)
+    : null;
+
+  return {
+    subjectId:   item.subjectId,
+    subjectType: item.subjectType,
+    type:        resolveSubjectType(item.subjectType),
+    title:       item.title,
+    description: item.description ?? '',
+    releaseDate: item.releaseDate ?? null,
+    runtime:     runtimeMinutes,
+    genre:       item.genre ?? null,
+    poster:      item.cover?.url ?? null,
+    thumbnail:   item.cover?.thumbnail ?? '',
+    country:     item.countryName ?? null,
+    rating:      item.imdbRatingValue && item.imdbRatingValue !== '0'
+                   ? parseFloat(item.imdbRatingValue)
+                   : null,
+    hasResource: item.hasResource ?? false,
+    language:    item.language ?? null,
+  };
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
+
+function handleRoot(): Response {
+  return json({
+    name:        'Spün MovieBox API',
+    description: 'An unofficial REST API built by Spün for MovieBox — wrapping the MovieBox Android & H5 APIs with host pool fallback, request signing, and structured responses.',
+    version:     '1.0.0',
+    routes: [
+      { method: 'GET',  path: '/',                          auth: false,  description: 'API info and route listing' },
+      { method: 'GET',  path: '/health',                    auth: false,  description: 'Worker health check' },
+      { method: 'POST', path: '/search',                    auth: true,   description: 'Search for movies, TV shows, and shorts. Body: { keyword, page?, perPage? }' },
+      { method: 'GET',  path: '/info/:subjectId',           auth: true,   description: 'Get detail for a subject' },
+      { method: 'GET',  path: '/season/:subjectId',         auth: true,   description: 'Get season and episode structure for a TV show or shorts series' },
+      { method: 'GET',  path: '/stream/:subjectId',         auth: true,   description: 'Stream URLs for a specific episode. Params: se (season), ep (episode). Use se=0&ep=0 for movies.' },
+      { method: 'GET',  path: '/stream/:subjectId/all',     auth: true,   description: 'All stream URLs for all episodes grouped by episode. Useful for shorts and full series bulk fetch.' },
+      { method: 'GET',  path: '/download/:subjectId',       auth: true,   description: 'Full download pack grouped by season → episode → quality' },
+      { method: 'GET',  path: '/home',                      auth: true,   description: 'MovieBox homepage rows with subjects (Africa/Lagos feed)' },
+      { method: 'GET',  path: '/home/subjects?opId=X',      auth: true,   description: 'Subjects for a specific homepage row by opId' },
+    ],
+  });
+}
 
 async function handleSearch(request: Request): Promise<Response> {
   let body: Record<string, unknown>;
@@ -169,22 +290,22 @@ async function handleSearch(request: Request): Promise<Response> {
   const items = (data.items || [])
     .filter((item) => ALLOWED_SUBJECT_TYPES.has(item.subjectType))
     .map((item) => ({
-    subjectId:   item.subjectId,
-    subjectType: item.subjectType,
-    title:       item.title,
-    description: item.description ?? '',
-    releaseDate: item.releaseDate ?? null,
-    duration:    item.duration ?? null,
-    genre:       item.genre ?? null,
-    poster:      item.cover?.url ?? null,
-    thumbnail:   item.cover?.thumbnail ?? null,
-    country:     item.countryName ?? null,
-    rating:      item.imdbRatingValue && item.imdbRatingValue !== '0'
-                   ? parseFloat(item.imdbRatingValue)
-                   : null,
-    language:    item.language ?? null,
-    type:        resolveSubjectType(item.subjectType),
-  }));
+      subjectId:   item.subjectId,
+      subjectType: item.subjectType,
+      title:       item.title,
+      description: item.description ?? '',
+      releaseDate: item.releaseDate ?? null,
+      duration:    item.duration ?? null,
+      genre:       item.genre ?? null,
+      poster:      item.cover?.url ?? null,
+      thumbnail:   item.cover?.thumbnail ?? null,
+      country:     item.countryName ?? null,
+      rating:      item.imdbRatingValue && item.imdbRatingValue !== '0'
+                     ? parseFloat(item.imdbRatingValue)
+                     : null,
+      language:    item.language ?? null,
+      type:        resolveSubjectType(item.subjectType),
+    }));
 
   return json({ items, pager: data.pager });
 }
@@ -263,15 +384,13 @@ async function handleSeason(subjectId: string): Promise<Response> {
 }
 
 // GET /stream/:subjectId?se=X&ep=Y
-// Fetches full resource pack, filters to the specific episode, deduplicates by quality.
-// Returns MP4 URLs — player picks quality.
+// Returns MP4 URLs for a specific episode, deduplicated by quality.
+// Use se=0&ep=0 for movies (returns full pack as one item per quality).
 
 async function handleStream(subjectId: string, se: number, ep: number): Promise<Response> {
   const pack = await fetchResourcePack(subjectId);
   if (!pack) return err('No streams available', 404);
 
-  // For movies se=0&ep=0 — return full pack as-is (single item per quality)
-  // For TV filter to the specific episode
   const isMovie = se === 0 && ep === 0;
   let items = pack;
 
@@ -281,7 +400,7 @@ async function handleStream(subjectId: string, se: number, ep: number): Promise<
     items = filtered;
   }
 
-  // Deduplicate by quality — keep first (best encode per resolution)
+  // Deduplicate by quality — keep first (highest resolution sort already applied)
   const seenQualities = new Set<string>();
   const streams = items
     .filter((item) => {
@@ -295,15 +414,46 @@ async function handleStream(subjectId: string, se: number, ep: number): Promise<
   return json({ streams, total: streams.length });
 }
 
+// GET /stream/:subjectId/all
+// Returns ALL stream URLs for all episodes, grouped by episode.
+// Designed for shorts series and bulk prefetch — no se/ep filtering.
+
+async function handleStreamAll(subjectId: string): Promise<Response> {
+  const pack = await fetchResourcePack(subjectId);
+  if (!pack) return err('No streams available', 404);
+
+  // Group by episode (ep) — deduplicate by quality within each episode
+  const episodeMap = new Map<number, ReturnType<typeof mapResourceItem>[]>();
+
+  for (const item of pack) {
+    const epKey = item.ep;
+    if (!episodeMap.has(epKey)) episodeMap.set(epKey, []);
+    const qualities = episodeMap.get(epKey)!;
+
+    const q = `${item.resolution}p`;
+    if (!qualities.find((x) => x.quality === q)) {
+      qualities.push(mapResourceItem(item));
+    }
+  }
+
+  const episodes = [...episodeMap.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([epNum, streams]) => ({
+      episode: epNum,
+      streams,
+      total:   streams.length,
+    }));
+
+  return json({ episodes, total_episodes: episodes.length });
+}
+
 // GET /download/:subjectId
 // Returns full pack grouped by season → episodes → qualities.
-// No se/ep params — always returns everything available.
 
 async function handleDownload(subjectId: string): Promise<Response> {
   const pack = await fetchResourcePack(subjectId);
   if (!pack) return err('No downloads available', 404);
 
-  // Group by season (se) → episode (ep) → deduplicated qualities
   const seasonMap = new Map<number, Map<number, ReturnType<typeof mapResourceItem>[]>>();
 
   for (const item of pack) {
@@ -311,24 +461,22 @@ async function handleDownload(subjectId: string): Promise<Response> {
     const epKey = item.ep;
 
     if (!seasonMap.has(seKey)) seasonMap.set(seKey, new Map());
-    const episodeMap = seasonMap.get(seKey)!;
+    const epMap = seasonMap.get(seKey)!;
 
-    if (!episodeMap.has(epKey)) episodeMap.set(epKey, []);
-    const qualities = episodeMap.get(epKey)!;
+    if (!epMap.has(epKey)) epMap.set(epKey, []);
+    const qualities = epMap.get(epKey)!;
 
-    // Deduplicate by quality within each episode
     const q = `${item.resolution}p`;
     if (!qualities.find((x) => x.quality === q)) {
       qualities.push(mapResourceItem(item));
     }
   }
 
-  // Convert to shape: seasons[] → episodes[] → qualities[]
   const seasons = [...seasonMap.entries()]
     .sort(([a], [b]) => a - b)
-    .map(([seasonNum, episodeMap]) => ({
+    .map(([seasonNum, epMap]) => ({
       season: seasonNum,
-      episodes: [...episodeMap.entries()]
+      episodes: [...epMap.entries()]
         .sort(([a], [b]) => a - b)
         .map(([epNum, qualities]) => ({
           episode:  epNum,
@@ -339,33 +487,45 @@ async function handleDownload(subjectId: string): Promise<Response> {
   return json({ seasons, total_seasons: seasons.length });
 }
 
-// GET /home?page=1&tabId=0
-// Returns homepage rows from the MovieBox tab-operating endpoint.
-// region=NG so results are Africa-biased (Nollywood, Anime Dub, etc.)
+// GET /home
+// Returns all homepage rows with their subjects (Africa/Lagos feed).
 
-async function handleHome(url: URL): Promise<Response> {
-  const page  = parseInt(url.searchParams.get('page')  ?? '1');
-  const tabId = parseInt(url.searchParams.get('tabId') ?? '0');
-
-  const data = await fetchWithHostPool<MBHomeData>(
-    PATHS.home, 'GET', { page, tabId, version: '' }
-  );
-
+async function handleHome(): Promise<Response> {
+  const data = await fetchH5Home();
   if (!data) return err('Failed to fetch homepage', 502);
 
-  const rows: MBHomeRow[] =
-    data.topicList ?? data.operatingList ?? data.items ?? data.list ?? [];
+  const rows = (data.operatingList || []).map((row) => ({
+    title:    row.title,
+    opId:     row.opId,
+    type:     row.type,
+    total:    (row.subjects || []).length,
+    subjects: (row.subjects || [])
+      .filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType))
+      .map(normalizeH5Subject),
+  }));
+
+  return json({ total: rows.length, rows });
+}
+
+// GET /home/subjects?opId=X
+// Returns subjects for a specific homepage row.
+
+async function handleHomeSubjects(opId: string): Promise<Response> {
+  const data = await fetchH5Home();
+  if (!data) return err('Failed to fetch homepage', 502);
+
+  const row = (data.operatingList || []).find((r) => r.opId === opId);
+  if (!row) return err('Row not found', 404);
+
+  const subjects = (row.subjects || [])
+    .filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType))
+    .map(normalizeH5Subject);
 
   return json({
-    tabId,
-    page,
-    total: rows.length,
-    rows: rows.map((row) => ({
-      title:    row.title,
-      opId:     row.opId,
-      type:     row.type,
-      subjects: (row.subjects ?? row.items ?? []).length,
-    })),
+    opId:     row.opId,
+    title:    row.title,
+    total:    subjects.length,
+    subjects,
   });
 }
 
@@ -386,7 +546,12 @@ export default {
     const url  = new URL(request.url);
     const path = url.pathname;
 
-    if (path === '/health') {
+    // Public routes — no auth required
+    if (path === '/' && request.method === 'GET') {
+      return handleRoot();
+    }
+
+    if (path === '/health' && request.method === 'GET') {
       return json({ status: 'ok', worker: 'moviebox-worker', ts: Date.now() });
     }
 
@@ -397,11 +562,6 @@ export default {
     // POST /search
     if (path === '/search' && request.method === 'POST') {
       return handleSearch(request);
-    }
-
-    // GET /home?page=1&tabId=0
-    if (path === '/home' && request.method === 'GET') {
-      return handleHome(url);
     }
 
     // GET /info/:subjectId
@@ -416,6 +576,12 @@ export default {
       return handleSeason(seasonMatch[1]);
     }
 
+    // GET /stream/:subjectId/all — must be checked before /stream/:subjectId
+    const streamAllMatch = path.match(/^\/stream\/([^/]+)\/all$/);
+    if (streamAllMatch && request.method === 'GET') {
+      return handleStreamAll(streamAllMatch[1]);
+    }
+
     // GET /stream/:subjectId?se=X&ep=Y
     const streamMatch = path.match(/^\/stream\/([^/]+)$/);
     if (streamMatch && request.method === 'GET') {
@@ -424,86 +590,22 @@ export default {
       return handleStream(streamMatch[1], se, ep);
     }
 
-    // GET /download/:subjectId  (no se/ep — always full pack)
+    // GET /download/:subjectId
     const downloadMatch = path.match(/^\/download\/([^/]+)$/);
     if (downloadMatch && request.method === 'GET') {
       return handleDownload(downloadMatch[1]);
     }
 
-    // TEMP DEBUG — remove after testing
-    // GET /debug/resource/:subjectId        — raw single page call
-    // GET /debug/pack/:subjectId            — full fetchResourcePack run with diagnostics
-    const debugMatch = path.match(/^\/debug\/resource\/([^/]+)$/);
-    if (debugMatch && request.method === 'GET') {
-      const resolution = parseInt(url.searchParams.get('resolution') ?? '1080');
-      const page       = parseInt(url.searchParams.get('page') ?? '1');
-      const raw = await fetchWithHostPool<unknown>(
-        PATHS.resource, 'GET',
-        { subjectId: debugMatch[1], se: 0, ep: 0, resolution, page, perPage: 10 }
-      );
-      return json({ raw });
+    // GET /home/subjects?opId=X — must be checked before /home
+    if (path === '/home/subjects' && request.method === 'GET') {
+      const opId = url.searchParams.get('opId');
+      if (!opId) return err('opId is required');
+      return handleHomeSubjects(opId);
     }
 
-    const debugPackMatch = path.match(/^\/debug\/pack\/([^/]+)$/);
-    if (debugPackMatch && request.method === 'GET') {
-      const subjectId = debugPackMatch[1];
-      const log: unknown[] = [];
-      const seenResourceIds = new Set<string>();
-      const allItems: MBResourceItem[] = [];
-      const perPage = 10;
-      const RES = [360, 480, 720, 1080];
-
-      for (const resolution of RES) {
-        let page = 1;
-        let pagesForRes = 0;
-
-        while (true) {
-          const data = await fetchWithHostPool<MBResourceData>(
-            PATHS.resource, 'GET', { subjectId, se: 0, ep: 0, resolution, page, perPage }
-          );
-
-          if (!data) {
-            log.push({ resolution, page, result: 'null — fetchWithHostPool returned null' });
-            break;
-          }
-
-          if (!data.list) {
-            log.push({ resolution, page, result: 'no list field', keys: Object.keys(data) });
-            break;
-          }
-
-          if (!data.list.length) {
-            log.push({ resolution, page, result: 'empty list', hasMore: data.pager?.hasMore });
-            break;
-          }
-
-          const newItems = data.list.filter(item => !seenResourceIds.has(item.resourceId));
-          newItems.forEach(item => {
-            seenResourceIds.add(item.resourceId);
-            allItems.push(item);
-          });
-
-          log.push({
-            resolution,
-            page,
-            itemsOnPage: data.list.length,
-            newItems: newItems.length,
-            hasMore: data.pager?.hasMore,
-            totalCount: data.pager?.totalCount,
-          });
-
-          if (!data.pager?.hasMore) break;
-          page++;
-          pagesForRes++;
-          if (page > 100) { log.push({ resolution, note: 'hit 100 page cap' }); break; }
-        }
-      }
-
-      return json({
-        totalCollected: allItems.length,
-        log,
-        sample: allItems.slice(0, 3).map(i => ({ se: i.se, ep: i.ep, resolution: i.resolution, resourceId: i.resourceId })),
-      });
+    // GET /home
+    if (path === '/home' && request.method === 'GET') {
+      return handleHome();
     }
 
     return err('Not found', 404);
