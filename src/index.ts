@@ -79,7 +79,7 @@ const RESOLUTIONS = [360, 480, 720, 1080];
 async function fetchResourcePack(subjectId: string): Promise<MBResourceItem[] | null> {
   const seenResourceIds = new Set<string>();
   const allItems: MBResourceItem[] = [];
-  const perPage = 50;
+  const perPage = 10; // server silently rejects values above 10
 
   for (const resolution of RESOLUTIONS) {
     let page = 1;
@@ -412,7 +412,7 @@ export default {
       const log: unknown[] = [];
       const seenResourceIds = new Set<string>();
       const allItems: MBResourceItem[] = [];
-      const perPage = 50;
+      const perPage = 10; // server silently rejects values above 10
       const RES = [360, 480, 720, 1080];
 
       for (const resolution of RES) {
