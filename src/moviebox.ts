@@ -116,7 +116,7 @@ export async function fetchWithHostPool<T>(
 ): Promise<T | null> {
   const bodyStr = body ? JSON.stringify(body) : null;
 
-  for (const base of HOST_POOL) {
+  const responses = await Promise.allSettled(HOST_POOL.map(async (base) => {
     // Build URL with query params
     const url = new URL(`${base}${path}`);
     if (params) {
@@ -128,28 +128,31 @@ export async function fetchWithHostPool<T>(
     const urlStr = url.toString();
     const headers = await buildHeaders(method, urlStr, bodyStr);
 
-    try {
-      const response = await fetch(urlStr, {
-        method,
-        headers,
-        body: bodyStr ?? undefined,
-        signal: AbortSignal.timeout(12000),
-      });
+    const response = await fetch(urlStr, {
+      method,
+      headers,
+      body: bodyStr ?? undefined,
+      signal: AbortSignal.timeout(12000),
+    });
 
-      if (!response.ok) {
-        console.warn(`[MovieBox] Host ${base} returned ${response.status} — trying next`);
-        continue;
-      }
+    if (!response.ok) {
+      throw new Error(`Host ${base} returned ${response.status}`);
+    }
 
-      const data = await response.json() as { code: number; data?: T };
+    const data = await response.json() as { code: number; data?: T };
 
-      if (data.code === 0) {
-        return data.data as T;
-      }
+    if (data.code === 0) {
+      return data.data as T;
+    }
 
-      console.warn(`[MovieBox] Host ${base} returned API code ${data.code} — trying next`);
-    } catch (err) {
-      console.warn(`[MovieBox] Host ${base} failed: ${err} — trying next`);
+    throw new Error(`Host ${base} returned API code ${data.code}`);
+  }));
+
+  for (const response of responses) {
+    if (response.status === 'fulfilled' && response.value) {
+      return response.value;
+    } else if (response.status === 'rejected') {
+      console.warn(`[MovieBox] Host failed: ${response.reason} — trying next`);
     }
   }
 

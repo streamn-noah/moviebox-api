@@ -84,9 +84,7 @@ async function fetchResourcePack(subjectId: string): Promise<MBResourceItem[] | 
 
     if (!data?.list?.length) break;
 
-    // Collect only free content
-    const free = data.list.filter((r) => (r.requireMemberType ?? 0) === 0);
-    allItems.push(...free);
+    allItems.push(...data.list);
 
     // Stop if no more pages
     if (!data.pager?.hasMore) break;
@@ -221,33 +219,45 @@ async function handleInfo(subjectId: string): Promise<Response> {
 }
 
 async function handleSeason(subjectId: string): Promise<Response> {
-  const data = await fetchWithHostPool<MBSeasonData>(
+  const seasonData = await fetchWithHostPool<MBSeasonData>(
     PATHS.seasonInfo, 'GET', { subjectId }
   );
 
-  if (!data?.seasons?.length) return json({ seasons: [] });
+  if (!seasonData?.seasons?.length) return json({ seasons: [] });
 
-  return json({
-    seasons: data.seasons.map((s) => {
-      const episodes = Array.from({ length: s.maxEp }, (_, i) => ({
-        episode:     i + 1,
-        title:       null,
-        releaseDate: null,
-      }));
+  const resourcePack = await fetchResourcePack(subjectId);
+  const availableEpisodes = new Set<string>(); // Store as 'se-ep'
 
-      const bestEpCount = s.resolutions?.length
-        ? Math.max(...s.resolutions.map((r) => r.epNum))
-        : s.maxEp;
+  if (resourcePack) {
+    for (const item of resourcePack) {
+      availableEpisodes.add(`${item.se}-${item.ep}`);
+    }
+  }
 
+  const seasons = seasonData.seasons.map((s) => {
+    const episodes = Array.from({ length: s.maxEp }, (_, i) => {
+      const epNum = i + 1;
+      const isAvailable = availableEpisodes.has(`${s.se}-${epNum}`);
       return {
-        season:            s.se,
-        totalEpisode:      s.maxEp,
-        episodesAvailable: bestEpCount,
-        resolutions:       s.resolutions || [],
-        episodes,
+        episode:     epNum,
+        title:       null, // MovieBox seasonInfo doesn't provide episode titles
+        releaseDate: null, // MovieBox seasonInfo doesn't provide episode release dates
+        isAvailable: isAvailable,
       };
-    }),
+    });
+
+    const episodesAvailableCount = episodes.filter(ep => ep.isAvailable).length;
+
+    return {
+      season:            s.se,
+      totalEpisode:      s.maxEp,
+      episodesAvailable: episodesAvailableCount,
+      resolutions:       s.resolutions || [],
+      episodes,
+    };
   });
+
+  return json({ seasons });
 }
 
 // GET /stream/:subjectId?se=X&ep=Y
