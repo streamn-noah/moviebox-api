@@ -36,7 +36,6 @@ export const PATHS = {
   seasonInfo: '/wefeed-mobile-bff/subject-api/season-info',
   resource:   '/wefeed-mobile-bff/subject-api/resource',
   captions:   '/wefeed-mobile-bff/subject-api/get-ext-captions',
-  home:       '/wefeed-mobile-bff/tab-operating',
 };
 
 // ─── Client identity ──────────────────────────────────────────────────────────
@@ -63,8 +62,8 @@ function makeClientInfo(): string {
     model:           DEVICE_MODEL,
     system_language: 'en',
     net:             'NETWORK_WIFI',
-    region:          'NG',
-    timezone:        'Africa/Lagos',
+    region:          'US',
+    timezone:        'America/New_York',
     sp_code:         '40401',
     'X-Play-Mode':   '2',
   });
@@ -230,19 +229,4 @@ export interface MBResourceItem {
 export interface MBResourceData {
   pager: { hasMore: boolean; totalCount: number; nextPage?: string; page?: string; perPage?: number };
   list:  MBResourceItem[];
-}
-
-export interface MBHomeRow {
-  title:     string;
-  opId:      string;
-  type:      string;
-  subjects?: unknown[];
-  items?:    unknown[];
-}
-
-export interface MBHomeData {
-  topicList?:     MBHomeRow[];
-  operatingList?: MBHomeRow[];
-  items?:         MBHomeRow[];
-  list?:          MBHomeRow[];
 }
