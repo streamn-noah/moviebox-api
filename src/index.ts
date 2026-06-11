@@ -6,6 +6,7 @@
 //   GET  /info/:subjectId
 //   GET  /season/:subjectId
 //   GET  /stream/:subjectId   ?se=X&ep=Y  — returns MP4 URLs for specific episode
+//   GET  /stream/:subjectId/all           — returns all resources (shorts)
 //   GET  /download/:subjectId             — returns full pack grouped by season/episode
 //   GET  /health
 //
@@ -72,15 +73,25 @@ const LANGUAGE_NAMES: Record<string, string> = {
 // ─── Shared: fetch full resource pack (all pages) ────────────────────────────
 // MovieBox paginates the resource endpoint. We fetch all pages until hasMore=false
 // to get every episode across all seasons for this subject.
+//
+// IMPORTANT: se=0&ep=0 is only valid for movies (subjectType=1).
+// For TV (subjectType=2) and shorts (subjectType=7), omit se/ep entirely —
+// the API then returns all available resources across all seasons/episodes.
 
-async function fetchResourcePack(subjectId: string): Promise<MBResourceItem[] | null> {
+async function fetchResourcePack(subjectId: string, subjectType?: number): Promise<MBResourceItem[] | null> {
   const allItems: MBResourceItem[] = [];
   const perPage = 50;
+
+  // Movies use se=0&ep=0 as the resource key; TV/shorts omit those params.
+  const isMovie = subjectType === 1 || subjectType === undefined;
+  const baseParams: Record<string, string | number> = isMovie
+    ? { subjectId, se: 0, ep: 0, page: 1, perPage }
+    : { subjectId, page: 1, perPage };
 
   // We fetch from all hosts simultaneously and merge their results.
   // This ensures we get every available episode and quality.
   const allHostResponses = await fetchFromAllHosts<MBResourceData>(
-    PATHS.resource, 'GET', { subjectId, se: 0, ep: 0, page: 1, perPage }
+    PATHS.resource, 'GET', { ...baseParams }
   );
 
   if (!allHostResponses.length) return null;
@@ -106,8 +117,12 @@ async function fetchResourcePack(subjectId: string): Promise<MBResourceItem[] | 
     const remainingPages = Array.from({ length: totalPages - 1 }, (_, i) => i + 2);
 
     for (const page of remainingPages) {
+      const pageParams: Record<string, string | number> = isMovie
+        ? { subjectId, se: 0, ep: 0, page, perPage }
+        : { subjectId, page, perPage };
+
       const pageResponses = await fetchFromAllHosts<MBResourceData>(
-        PATHS.resource, 'GET', { subjectId, se: 0, ep: 0, page, perPage }
+        PATHS.resource, 'GET', { ...pageParams }
       );
       for (const response of pageResponses) {
         if (response.list) {
@@ -252,7 +267,10 @@ async function handleSeason(subjectId: string): Promise<Response> {
 
   if (!seasonData?.seasons?.length) return json({ seasons: [] });
 
-  const resourcePack = await fetchResourcePack(subjectId);
+  // subjectType is present on the season-info response — pass it so fetchResourcePack
+  // uses the correct params (movies need se=0&ep=0; TV omits those fields).
+  const subjectType = (seasonData as any).subjectType as number | undefined;
+  const resourcePack = await fetchResourcePack(subjectId, subjectType);
   const availableEpisodes = new Set<string>(); // Store as 'se-ep'
 
   if (resourcePack) {
@@ -292,7 +310,9 @@ async function handleSeason(subjectId: string): Promise<Response> {
 // Returns MP4 URLs — player picks quality.
 
 async function handleStream(subjectId: string, se: number, ep: number): Promise<Response> {
-  const pack = await fetchResourcePack(subjectId);
+  // Infer subjectType from params: se=0&ep=0 means movie (subjectType=1), otherwise TV (subjectType=2)
+  const inferredSubjectType = (se === 0 && ep === 0) ? 1 : 2;
+  const pack = await fetchResourcePack(subjectId, inferredSubjectType);
   if (!pack) return err('No streams available', 404);
 
   // For movies se=0&ep=0 — return full pack as-is (single item per quality)
@@ -325,7 +345,11 @@ async function handleStream(subjectId: string, se: number, ep: number): Promise<
 // No se/ep params — always returns everything available.
 
 async function handleDownload(subjectId: string): Promise<Response> {
-  const pack = await fetchResourcePack(subjectId);
+  // Fetch info to determine subjectType — needed so fetchResourcePack uses the right params.
+  const info = await fetchWithHostPool<MBDetailData>(PATHS.get, 'GET', { subjectId });
+  const subjectType = info?.subjectType ?? 1; // default to movie (1) if unknown
+
+  const pack = await fetchResourcePack(subjectId, subjectType);
   if (!pack) return err('No downloads available', 404);
 
   // Group by season (se) → episode (ep) → deduplicated qualities
@@ -412,6 +436,15 @@ export default {
       const se = parseInt(url.searchParams.get('se') ?? '0');
       const ep = parseInt(url.searchParams.get('ep') ?? '0');
       return handleStream(streamMatch[1], se, ep);
+    }
+
+    // GET /stream/:subjectId/all — returns every resource item (used for shorts)
+    const streamAllMatch = path.match(/^\/stream\/([^/]+)\/all$/);
+    if (streamAllMatch && request.method === 'GET') {
+      const pack = await fetchResourcePack(streamAllMatch[1], 7); // 7=shorts
+      if (!pack) return err('No streams available', 404);
+      const streams = pack.map(mapResourceItem);
+      return json({ streams, total: streams.length });
     }
 
     // GET /download/:subjectId  (no se/ep — always full pack)
