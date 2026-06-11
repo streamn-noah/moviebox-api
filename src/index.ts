@@ -392,6 +392,19 @@ export default {
       return handleDownload(downloadMatch[1]);
     }
 
+    // TEMP DEBUG — remove after testing
+    // GET /debug/resource/:subjectId?resolution=1080&page=1
+    const debugMatch = path.match(/^\/debug\/resource\/([^/]+)$/);
+    if (debugMatch && request.method === 'GET') {
+      const resolution = parseInt(url.searchParams.get('resolution') ?? '1080');
+      const page       = parseInt(url.searchParams.get('page') ?? '1');
+      const raw = await fetchWithHostPool<unknown>(
+        PATHS.resource, 'GET',
+        { subjectId: debugMatch[1], se: 0, ep: 0, resolution, page, perPage: 10 }
+      );
+      return json({ raw });
+    }
+
     return err('Not found', 404);
   },
 };
