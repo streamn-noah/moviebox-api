@@ -7,6 +7,7 @@
 //   GET  /season/:subjectId
 //   GET  /stream/:subjectId   ?se=X&ep=Y  — returns MP4 URLs for specific episode
 //   GET  /download/:subjectId             — returns full pack grouped by season/episode
+//   GET  /home                ?page=1&tabId=0
 //   GET  /health
 //
 // /stream and /download both use the /resource endpoint (direct MP4 links).
@@ -20,6 +21,8 @@ import {
   type MBSeasonData,
   type MBResourceData,
   type MBResourceItem,
+  type MBHomeData,
+  type MBHomeRow,
 } from './moviebox.js';
 
 // subjectType: 1=movie, 2=tv, 7=shorts — 5,6,8 filtered out
@@ -320,7 +323,7 @@ async function handleDownload(subjectId: string): Promise<Response> {
     }
   }
 
-  // Convert to Option B shape: seasons[] → episodes[] → qualities[]
+  // Convert to shape: seasons[] → episodes[] → qualities[]
   const seasons = [...seasonMap.entries()]
     .sort(([a], [b]) => a - b)
     .map(([seasonNum, episodeMap]) => ({
@@ -334,6 +337,36 @@ async function handleDownload(subjectId: string): Promise<Response> {
     }));
 
   return json({ seasons, total_seasons: seasons.length });
+}
+
+// GET /home?page=1&tabId=0
+// Returns homepage rows from the MovieBox tab-operating endpoint.
+// region=NG so results are Africa-biased (Nollywood, Anime Dub, etc.)
+
+async function handleHome(url: URL): Promise<Response> {
+  const page  = parseInt(url.searchParams.get('page')  ?? '1');
+  const tabId = parseInt(url.searchParams.get('tabId') ?? '0');
+
+  const data = await fetchWithHostPool<MBHomeData>(
+    PATHS.home, 'GET', { page, tabId, version: '' }
+  );
+
+  if (!data) return err('Failed to fetch homepage', 502);
+
+  const rows: MBHomeRow[] =
+    data.topicList ?? data.operatingList ?? data.items ?? data.list ?? [];
+
+  return json({
+    tabId,
+    page,
+    total: rows.length,
+    rows: rows.map((row) => ({
+      title:    row.title,
+      opId:     row.opId,
+      type:     row.type,
+      subjects: (row.subjects ?? row.items ?? []).length,
+    })),
+  });
 }
 
 // ─── Router ───────────────────────────────────────────────────────────────────
@@ -364,6 +397,11 @@ export default {
     // POST /search
     if (path === '/search' && request.method === 'POST') {
       return handleSearch(request);
+    }
+
+    // GET /home?page=1&tabId=0
+    if (path === '/home' && request.method === 'GET') {
+      return handleHome(url);
     }
 
     // GET /info/:subjectId
@@ -412,7 +450,7 @@ export default {
       const log: unknown[] = [];
       const seenResourceIds = new Set<string>();
       const allItems: MBResourceItem[] = [];
-      const perPage = 10; // server silently rejects values above 10
+      const perPage = 10;
       const RES = [360, 480, 720, 1080];
 
       for (const resolution of RES) {
