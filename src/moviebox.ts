@@ -117,7 +117,6 @@ export async function fetchWithHostPool<T>(
   const bodyStr = body ? JSON.stringify(body) : null;
 
   const responses = await Promise.allSettled(HOST_POOL.map(async (base) => {
-    // Build URL with query params
     const url = new URL(`${base}${path}`);
     if (params) {
       for (const [key, value] of Object.entries(params)) {
@@ -135,29 +134,67 @@ export async function fetchWithHostPool<T>(
       signal: AbortSignal.timeout(12000),
     });
 
-    if (!response.ok) {
-      throw new Error(`Host ${base} returned ${response.status}`);
-    }
+    if (!response.ok) throw new Error(`Host ${base} returned ${response.status}`);
 
     const data = await response.json() as { code: number; data?: T };
-
-    if (data.code === 0) {
-      return data.data as T;
-    }
+    if (data.code === 0) return data.data as T;
 
     throw new Error(`Host ${base} returned API code ${data.code}`);
   }));
 
   for (const response of responses) {
-    if (response.status === 'fulfilled' && response.value) {
-      return response.value;
-    } else if (response.status === 'rejected') {
-      console.warn(`[MovieBox] Host failed: ${response.reason} — trying next`);
-    }
+    if (response.status === 'fulfilled' && response.value) return response.value;
   }
 
   console.error(`[MovieBox] All ${HOST_POOL.length} hosts exhausted for ${path}`);
   return null;
+}
+
+/**
+ * Fetches from all hosts simultaneously and returns all successful responses.
+ * Used for resource aggregation to ensure complete season/quality coverage.
+ */
+export async function fetchFromAllHosts<T>(
+  path: string,
+  method: 'GET' | 'POST',
+  params?: Record<string, string | number>,
+  body?: Record<string, unknown>
+): Promise<T[]> {
+  const bodyStr = body ? JSON.stringify(body) : null;
+
+  const responses = await Promise.allSettled(HOST_POOL.map(async (base) => {
+    const url = new URL(`${base}${path}`);
+    if (params) {
+      for (const [key, value] of Object.entries(params)) {
+        url.searchParams.set(key, String(value));
+      }
+    }
+
+    const urlStr = url.toString();
+    const headers = await buildHeaders(method, urlStr, bodyStr);
+
+    const response = await fetch(urlStr, {
+      method,
+      headers,
+      body: bodyStr ?? undefined,
+      signal: AbortSignal.timeout(12000),
+    });
+
+    if (!response.ok) throw new Error(`Host ${base} returned ${response.status}`);
+
+    const data = await response.json() as { code: number; data?: T };
+    if (data.code === 0 && data.data) return data.data as T;
+
+    throw new Error(`Host ${base} returned API code ${data.code}`);
+  }));
+
+  const results: T[] = [];
+  for (const r of responses) {
+    if (r.status === 'fulfilled') {
+      results.push(r.value as T);
+    }
+  }
+  return results;
 }
 
 // ─── Raw API response shapes ──────────────────────────────────────────────────

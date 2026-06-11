@@ -14,6 +14,7 @@
 
 import {
   fetchWithHostPool,
+  fetchFromAllHosts,
   PATHS,
   type MBSearchData,
   type MBDetailData,
@@ -74,25 +75,51 @@ const LANGUAGE_NAMES: Record<string, string> = {
 
 async function fetchResourcePack(subjectId: string): Promise<MBResourceItem[] | null> {
   const allItems: MBResourceItem[] = [];
-  let page = 1;
-  const perPage = 50; // max per page
+  const perPage = 50;
 
-  while (true) {
-    const data = await fetchWithHostPool<MBResourceData>(
-      PATHS.resource, 'GET', { subjectId, se: 0, ep: 0, page, perPage }
-    );
+  // We fetch from all hosts simultaneously and merge their results.
+  // This ensures we get every available episode and quality.
+  const allHostResponses = await fetchFromAllHosts<MBResourceData>(
+    PATHS.resource, 'GET', { subjectId, se: 0, ep: 0, page: 1, perPage }
+  );
 
-    if (!data?.list?.length) break;
+  if (!allHostResponses.length) return null;
 
-    allItems.push(...data.list);
+  // Track unique resource IDs to avoid duplicates across hosts
+  const seenResourceIds = new Set<string>();
 
-    // Stop if no more pages
-    if (!data.pager?.hasMore) break;
+  for (const response of allHostResponses) {
+    if (response.list) {
+      for (const item of response.list) {
+        if (!seenResourceIds.has(item.resourceId)) {
+          allItems.push(item);
+          seenResourceIds.add(item.resourceId);
+        }
+      }
+    }
+  }
 
-    page++;
+  // Handle pagination if any host indicates more results
+  const maxTotalCount = Math.max(...allHostResponses.map(r => r.pager?.totalCount ?? 0));
+  if (maxTotalCount > perPage) {
+    const totalPages = Math.min(Math.ceil(maxTotalCount / perPage), 20);
+    const remainingPages = Array.from({ length: totalPages - 1 }, (_, i) => i + 2);
 
-    // Safety cap — never fetch more than 20 pages
-    if (page > 20) break;
+    for (const page of remainingPages) {
+      const pageResponses = await fetchFromAllHosts<MBResourceData>(
+        PATHS.resource, 'GET', { subjectId, se: 0, ep: 0, page, perPage }
+      );
+      for (const response of pageResponses) {
+        if (response.list) {
+          for (const item of response.list) {
+            if (!seenResourceIds.has(item.resourceId)) {
+              allItems.push(item);
+              seenResourceIds.add(item.resourceId);
+            }
+          }
+        }
+      }
+    }
   }
 
   if (!allItems.length) return null;
