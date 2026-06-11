@@ -393,7 +393,8 @@ export default {
     }
 
     // TEMP DEBUG — remove after testing
-    // GET /debug/resource/:subjectId?resolution=1080&page=1
+    // GET /debug/resource/:subjectId        — raw single page call
+    // GET /debug/pack/:subjectId            — full fetchResourcePack run with diagnostics
     const debugMatch = path.match(/^\/debug\/resource\/([^/]+)$/);
     if (debugMatch && request.method === 'GET') {
       const resolution = parseInt(url.searchParams.get('resolution') ?? '1080');
@@ -403,6 +404,68 @@ export default {
         { subjectId: debugMatch[1], se: 0, ep: 0, resolution, page, perPage: 10 }
       );
       return json({ raw });
+    }
+
+    const debugPackMatch = path.match(/^\/debug\/pack\/([^/]+)$/);
+    if (debugPackMatch && request.method === 'GET') {
+      const subjectId = debugPackMatch[1];
+      const log: unknown[] = [];
+      const seenResourceIds = new Set<string>();
+      const allItems: MBResourceItem[] = [];
+      const perPage = 50;
+      const RES = [360, 480, 720, 1080];
+
+      for (const resolution of RES) {
+        let page = 1;
+        let pagesForRes = 0;
+
+        while (true) {
+          const data = await fetchWithHostPool<MBResourceData>(
+            PATHS.resource, 'GET', { subjectId, se: 0, ep: 0, resolution, page, perPage }
+          );
+
+          if (!data) {
+            log.push({ resolution, page, result: 'null — fetchWithHostPool returned null' });
+            break;
+          }
+
+          if (!data.list) {
+            log.push({ resolution, page, result: 'no list field', keys: Object.keys(data) });
+            break;
+          }
+
+          if (!data.list.length) {
+            log.push({ resolution, page, result: 'empty list', hasMore: data.pager?.hasMore });
+            break;
+          }
+
+          const newItems = data.list.filter(item => !seenResourceIds.has(item.resourceId));
+          newItems.forEach(item => {
+            seenResourceIds.add(item.resourceId);
+            allItems.push(item);
+          });
+
+          log.push({
+            resolution,
+            page,
+            itemsOnPage: data.list.length,
+            newItems: newItems.length,
+            hasMore: data.pager?.hasMore,
+            totalCount: data.pager?.totalCount,
+          });
+
+          if (!data.pager?.hasMore) break;
+          page++;
+          pagesForRes++;
+          if (page > 100) { log.push({ resolution, note: 'hit 100 page cap' }); break; }
+        }
+      }
+
+      return json({
+        totalCollected: allItems.length,
+        log,
+        sample: allItems.slice(0, 3).map(i => ({ se: i.se, ep: i.ep, resolution: i.resolution, resourceId: i.resourceId })),
+      });
     }
 
     return err('Not found', 404);
