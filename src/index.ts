@@ -261,6 +261,7 @@ function handleRoot(): Response {
       { method: 'GET',  path: '/stream/:subjectId/all',     auth: true,   description: 'All stream URLs for all episodes grouped by episode. Useful for shorts and full series bulk fetch.' },
       { method: 'GET',  path: '/download/:subjectId',       auth: true,   description: 'Full download pack grouped by season → episode → quality' },
       { method: 'GET',  path: '/home',                      auth: true,   description: 'MovieBox homepage rows with subjects (Africa/Lagos feed)' },
+      { method: 'GET',  path: '/home/rows',                 auth: true,   description: 'All homepage row titles and opIds — use to discover rows before fetching subjects' },
       { method: 'GET',  path: '/home/subjects?opId=X',      auth: true,   description: 'Subjects for a specific homepage row by opId' },
     ],
   });
@@ -415,36 +416,47 @@ async function handleStream(subjectId: string, se: number, ep: number): Promise<
 }
 
 // GET /stream/:subjectId/all
-// Returns ALL stream URLs for all episodes, grouped by episode.
-// Designed for shorts series and bulk prefetch — no se/ep filtering.
+// Returns ALL stream URLs grouped by season → episode.
+// Works for both shorts (se=1, flat episode list) and full TV series.
+// No se/ep filtering — always returns the complete pack.
 
 async function handleStreamAll(subjectId: string): Promise<Response> {
   const pack = await fetchResourcePack(subjectId);
   if (!pack) return err('No streams available', 404);
 
-  // Group by episode (ep) — deduplicate by quality within each episode
-  const episodeMap = new Map<number, ReturnType<typeof mapResourceItem>[]>();
+  // Group by season (se) → episode (ep) — deduplicate by quality within each episode
+  const seasonMap = new Map<number, Map<number, ReturnType<typeof mapResourceItem>[]>>();
 
   for (const item of pack) {
+    const seKey = item.se;
     const epKey = item.ep;
-    if (!episodeMap.has(epKey)) episodeMap.set(epKey, []);
-    const qualities = episodeMap.get(epKey)!;
+
+    if (!seasonMap.has(seKey)) seasonMap.set(seKey, new Map());
+    const epMap = seasonMap.get(seKey)!;
+
+    if (!epMap.has(epKey)) epMap.set(epKey, []);
+    const streams = epMap.get(epKey)!;
 
     const q = `${item.resolution}p`;
-    if (!qualities.find((x) => x.quality === q)) {
-      qualities.push(mapResourceItem(item));
+    if (!streams.find((x) => x.quality === q)) {
+      streams.push(mapResourceItem(item));
     }
   }
 
-  const episodes = [...episodeMap.entries()]
+  const seasons = [...seasonMap.entries()]
     .sort(([a], [b]) => a - b)
-    .map(([epNum, streams]) => ({
-      episode: epNum,
-      streams,
-      total:   streams.length,
+    .map(([seasonNum, epMap]) => ({
+      season: seasonNum,
+      episodes: [...epMap.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([epNum, streams]) => ({
+          episode: epNum,
+          streams,
+          total:   streams.length,
+        })),
     }));
 
-  return json({ episodes, total_episodes: episodes.length });
+  return json({ seasons, total_seasons: seasons.length });
 }
 
 // GET /download/:subjectId
@@ -485,6 +497,22 @@ async function handleDownload(subjectId: string): Promise<Response> {
     }));
 
   return json({ seasons, total_seasons: seasons.length });
+}
+
+// GET /home/rows
+// Returns all homepage row titles and opIds — lightweight discovery endpoint.
+// Use this to find opIds before calling /home/subjects.
+
+async function handleHomeRows(): Promise<Response> {
+  const data = await fetchH5Home();
+  if (!data) return err('Failed to fetch homepage', 502);
+
+  const rows = (data.operatingList || []).map((row) => ({
+    title: row.title,
+    opId:  row.opId,
+  }));
+
+  return json({ total: rows.length, rows });
 }
 
 // GET /home
@@ -594,6 +622,11 @@ export default {
     const downloadMatch = path.match(/^\/download\/([^/]+)$/);
     if (downloadMatch && request.method === 'GET') {
       return handleDownload(downloadMatch[1]);
+    }
+
+    // GET /home/rows — must be checked before /home
+    if (path === '/home/rows' && request.method === 'GET') {
+      return handleHomeRows();
     }
 
     // GET /home/subjects?opId=X — must be checked before /home
