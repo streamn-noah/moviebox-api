@@ -4,6 +4,7 @@ compatibility_date = "2024-11-01"
 compatibility_flags = ["nodejs_compat"]
 
 [vars]
+NIGERIA_IP = "197.211.52.65"
 # Set MOVIEBOX_SECRET via: wrangler secret put MOVIEBOX_SECRET
 # This must match MOVIEBOX_WORKER_SECRET in your D.Verse backend env
 
@@ -11,4 +12,3 @@ compatibility_flags = ["nodejs_compat"]
 # Update with your actual Cloudflare zone if using custom domain
 pattern = "moviebox.byspun.xyz/*"
 zone_name = "byspun.xyz"
-
