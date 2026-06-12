@@ -10,6 +10,7 @@
 //   GET  /stream/:subjectId/all        — all episodes with streams (shorts/series bulk)
 //   GET  /download/:subjectId          — full pack grouped by season/episode
 //   GET  /home                         — homepage rows + subjects (Africa feed)
+//   GET  /home/rows                    — all row titles and opIds
 //   GET  /home/subjects?opId=X         — subjects for a specific row
 //
 // /stream, /stream/all, and /download use the Android resource endpoint (7-host pool).
@@ -107,8 +108,7 @@ async function fetchResourcePack(subjectId: string): Promise<MBResourceItem[] | 
 
       page++;
 
-      // Safety cap — 100 pages x 10 items = 1000 items per resolution,
-      // enough for the longest series on MovieBox (e.g. One Piece ~1100 eps).
+      // Safety cap — 100 pages x 10 items = 1000 items per resolution
       if (page > 100) break;
     }
   }
@@ -149,8 +149,10 @@ function mapResourceItem(item: MBResourceItem) {
 // No HMAC signing needed — the H5 API only requires standard browser headers.
 // The Africa/Lagos timezone pin in X-Client-Info is what produces the Africa
 // region feed (Nollywood, Anime Dub, Black Shows rows). Do not change it.
+// Primary: netnaija.film — Fallback: h5.aoneroom.com, moviebox.pk
 
 const H5_HOSTS = [
+  'https://netnaija.film',
   'https://h5.aoneroom.com',
   'https://moviebox.pk',
 ];
@@ -179,11 +181,12 @@ interface H5Row {
   subjects: H5Subject[];
 }
 
-interface H5HomeData {
-  operatingList: H5Row[];
-}
+// Raw upstream response data — typed loosely because different hosts may use
+// different top-level keys (operatingList, topicList, list). extractRows()
+// handles all known variants so nothing is silently dropped.
+type H5RawData = Record<string, unknown>;
 
-async function fetchH5Home(): Promise<H5HomeData | null> {
+async function fetchH5Home(): Promise<H5Row[] | null> {
   for (const base of H5_HOSTS) {
     try {
       const response = await fetch(`${base}${H5_PATH}`, {
@@ -202,13 +205,22 @@ async function fetchH5Home(): Promise<H5HomeData | null> {
         continue;
       }
 
-      const data = await response.json() as { code: number; data?: H5HomeData };
+      const data = await response.json() as { code: number; data?: H5RawData };
 
-      if (data.code === 0 && data.data) {
-        return data.data;
+      if (data.code !== 0 || !data.data) {
+        console.warn(`[H5] Host ${base} returned API code ${data.code} — trying next`);
+        continue;
       }
 
-      console.warn(`[H5] Host ${base} returned API code ${data.code} — trying next`);
+      const rows = extractRows(data.data);
+
+      if (!rows.length) {
+        console.warn(`[H5] Host ${base} returned 0 rows — trying next`);
+        continue;
+      }
+
+      console.log(`[H5] Host ${base} returned ${rows.length} rows`);
+      return rows;
     } catch (e) {
       console.warn(`[H5] Host ${base} failed: ${e} — trying next`);
     }
@@ -216,6 +228,27 @@ async function fetchH5Home(): Promise<H5HomeData | null> {
 
   console.error('[H5] All hosts exhausted');
   return null;
+}
+
+// extractRows tries every known key the H5 API uses for the row list.
+// This prevents rows from being silently dropped when the upstream uses
+// a different key than expected (operatingList vs topicList vs list).
+
+function extractRows(data: H5RawData): H5Row[] {
+  const candidates = [
+    data['operatingList'],
+    data['topicList'],
+    data['list'],
+    data['items'],
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate) && candidate.length > 0) {
+      return candidate as H5Row[];
+    }
+  }
+
+  return [];
 }
 
 function normalizeH5Subject(item: H5Subject) {
@@ -260,7 +293,7 @@ function handleRoot(): Response {
       { method: 'GET',  path: '/stream/:subjectId',         auth: true,   description: 'Stream URLs for a specific episode. Params: se (season), ep (episode). Use se=0&ep=0 for movies.' },
       { method: 'GET',  path: '/stream/:subjectId/all',     auth: true,   description: 'All stream URLs for all episodes grouped by episode. Useful for shorts and full series bulk fetch.' },
       { method: 'GET',  path: '/download/:subjectId',       auth: true,   description: 'Full download pack grouped by season → episode → quality' },
-      { method: 'GET',  path: '/home',                      auth: true,   description: 'MovieBox homepage rows with subjects (Africa/Lagos feed)' },
+      { method: 'GET',  path: '/home',                      auth: true,   description: 'All homepage rows with subjects (Africa/Lagos feed)' },
       { method: 'GET',  path: '/home/rows',                 auth: true,   description: 'All homepage row titles and opIds — use to discover rows before fetching subjects' },
       { method: 'GET',  path: '/home/subjects?opId=X',      auth: true,   description: 'Subjects for a specific homepage row by opId' },
     ],
@@ -385,9 +418,6 @@ async function handleSeason(subjectId: string): Promise<Response> {
 }
 
 // GET /stream/:subjectId?se=X&ep=Y
-// Returns MP4 URLs for a specific episode, deduplicated by quality.
-// Use se=0&ep=0 for movies (returns full pack as one item per quality).
-
 async function handleStream(subjectId: string, se: number, ep: number): Promise<Response> {
   const pack = await fetchResourcePack(subjectId);
   if (!pack) return err('No streams available', 404);
@@ -401,7 +431,6 @@ async function handleStream(subjectId: string, se: number, ep: number): Promise<
     items = filtered;
   }
 
-  // Deduplicate by quality — keep first (highest resolution sort already applied)
   const seenQualities = new Set<string>();
   const streams = items
     .filter((item) => {
@@ -416,26 +445,18 @@ async function handleStream(subjectId: string, se: number, ep: number): Promise<
 }
 
 // GET /stream/:subjectId/all
-// Returns ALL stream URLs grouped by season → episode.
-// Works for both shorts (se=1, flat episode list) and full TV series.
-// No se/ep filtering — always returns the complete pack.
-
 async function handleStreamAll(subjectId: string): Promise<Response> {
   const pack = await fetchResourcePack(subjectId);
   if (!pack) return err('No streams available', 404);
 
-  // Group by season (se) → episode (ep) — deduplicate by quality within each episode
   const seasonMap = new Map<number, Map<number, ReturnType<typeof mapResourceItem>[]>>();
 
   for (const item of pack) {
-    const seKey = item.se;
-    const epKey = item.ep;
+    if (!seasonMap.has(item.se)) seasonMap.set(item.se, new Map());
+    const epMap = seasonMap.get(item.se)!;
 
-    if (!seasonMap.has(seKey)) seasonMap.set(seKey, new Map());
-    const epMap = seasonMap.get(seKey)!;
-
-    if (!epMap.has(epKey)) epMap.set(epKey, []);
-    const streams = epMap.get(epKey)!;
+    if (!epMap.has(item.ep)) epMap.set(item.ep, []);
+    const streams = epMap.get(item.ep)!;
 
     const q = `${item.resolution}p`;
     if (!streams.find((x) => x.quality === q)) {
@@ -460,8 +481,6 @@ async function handleStreamAll(subjectId: string): Promise<Response> {
 }
 
 // GET /download/:subjectId
-// Returns full pack grouped by season → episodes → qualities.
-
 async function handleDownload(subjectId: string): Promise<Response> {
   const pack = await fetchResourcePack(subjectId);
   if (!pack) return err('No downloads available', 404);
@@ -469,14 +488,11 @@ async function handleDownload(subjectId: string): Promise<Response> {
   const seasonMap = new Map<number, Map<number, ReturnType<typeof mapResourceItem>[]>>();
 
   for (const item of pack) {
-    const seKey = item.se;
-    const epKey = item.ep;
+    if (!seasonMap.has(item.se)) seasonMap.set(item.se, new Map());
+    const epMap = seasonMap.get(item.se)!;
 
-    if (!seasonMap.has(seKey)) seasonMap.set(seKey, new Map());
-    const epMap = seasonMap.get(seKey)!;
-
-    if (!epMap.has(epKey)) epMap.set(epKey, []);
-    const qualities = epMap.get(epKey)!;
+    if (!epMap.has(item.ep)) epMap.set(item.ep, []);
+    const qualities = epMap.get(item.ep)!;
 
     const q = `${item.resolution}p`;
     if (!qualities.find((x) => x.quality === q)) {
@@ -500,49 +516,41 @@ async function handleDownload(subjectId: string): Promise<Response> {
 }
 
 // GET /home/rows
-// Returns all homepage row titles and opIds — lightweight discovery endpoint.
-// Use this to find opIds before calling /home/subjects.
-
 async function handleHomeRows(): Promise<Response> {
-  const data = await fetchH5Home();
-  if (!data) return err('Failed to fetch homepage', 502);
+  const rows = await fetchH5Home();
+  if (!rows) return err('Failed to fetch homepage', 502);
 
-  const rows = (data.operatingList || []).map((row) => ({
-    title: row.title,
-    opId:  row.opId,
-  }));
-
-  return json({ total: rows.length, rows });
+  return json({
+    total: rows.length,
+    rows:  rows.map((row) => ({ title: row.title, opId: row.opId })),
+  });
 }
 
 // GET /home
-// Returns all homepage rows with their subjects (Africa/Lagos feed).
-
 async function handleHome(): Promise<Response> {
-  const data = await fetchH5Home();
-  if (!data) return err('Failed to fetch homepage', 502);
+  const rows = await fetchH5Home();
+  if (!rows) return err('Failed to fetch homepage', 502);
 
-  const rows = (data.operatingList || []).map((row) => ({
-    title:    row.title,
-    opId:     row.opId,
-    type:     row.type,
-    total:    (row.subjects || []).length,
-    subjects: (row.subjects || [])
-      .filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType))
-      .map(normalizeH5Subject),
-  }));
-
-  return json({ total: rows.length, rows });
+  return json({
+    total: rows.length,
+    rows:  rows.map((row) => ({
+      title:    row.title,
+      opId:     row.opId,
+      type:     row.type,
+      total:    (row.subjects || []).length,
+      subjects: (row.subjects || [])
+        .filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType))
+        .map(normalizeH5Subject),
+    })),
+  });
 }
 
 // GET /home/subjects?opId=X
-// Returns subjects for a specific homepage row.
-
 async function handleHomeSubjects(opId: string): Promise<Response> {
-  const data = await fetchH5Home();
-  if (!data) return err('Failed to fetch homepage', 502);
+  const rows = await fetchH5Home();
+  if (!rows) return err('Failed to fetch homepage', 502);
 
-  const row = (data.operatingList || []).find((r) => r.opId === opId);
+  const row = rows.find((r) => r.opId === opId);
   if (!row) return err('Row not found', 404);
 
   const subjects = (row.subjects || [])
@@ -592,6 +600,23 @@ export default {
       return handleSearch(request);
     }
 
+    // GET /home/rows — must be before /home to avoid partial match
+    if (path === '/home/rows' && request.method === 'GET') {
+      return handleHomeRows();
+    }
+
+    // GET /home/subjects?opId=X
+    if (path === '/home/subjects' && request.method === 'GET') {
+      const opId = url.searchParams.get('opId');
+      if (!opId) return err('opId is required');
+      return handleHomeSubjects(opId);
+    }
+
+    // GET /home
+    if (path === '/home' && request.method === 'GET') {
+      return handleHome();
+    }
+
     // GET /info/:subjectId
     const infoMatch = path.match(/^\/info\/([^/]+)$/);
     if (infoMatch && request.method === 'GET') {
@@ -604,7 +629,7 @@ export default {
       return handleSeason(seasonMatch[1]);
     }
 
-    // GET /stream/:subjectId/all — must be checked before /stream/:subjectId
+    // GET /stream/:subjectId/all
     const streamAllMatch = path.match(/^\/stream\/([^/]+)\/all$/);
     if (streamAllMatch && request.method === 'GET') {
       return handleStreamAll(streamAllMatch[1]);
@@ -622,23 +647,6 @@ export default {
     const downloadMatch = path.match(/^\/download\/([^/]+)$/);
     if (downloadMatch && request.method === 'GET') {
       return handleDownload(downloadMatch[1]);
-    }
-
-    // GET /home/rows — must be checked before /home
-    if (path === '/home/rows' && request.method === 'GET') {
-      return handleHomeRows();
-    }
-
-    // GET /home/subjects?opId=X — must be checked before /home
-    if (path === '/home/subjects' && request.method === 'GET') {
-      const opId = url.searchParams.get('opId');
-      if (!opId) return err('opId is required');
-      return handleHomeSubjects(opId);
-    }
-
-    // GET /home
-    if (path === '/home' && request.method === 'GET') {
-      return handleHome();
     }
 
     return err('Not found', 404);
