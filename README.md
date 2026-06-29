@@ -2,7 +2,7 @@
 
 # 🎬 Spün MovieBox API
 
-**An unofficial REST API built by [Spün](https://byspun.xyz) for MovieBox — wrapping the MovieBox Android & H5 APIs with host pool fallback, HMAC request signing, multi-quality stream resolution, and structured JSON responses, deployed on Cloudflare Workers.**
+**An unofficial REST API built by [Spün](https://byspun.xyz) for MovieBox — wrapping the MovieBox H5 web API with session-based auth, multi-quality stream resolution, embedded subtitles, and structured JSON responses, deployed on Cloudflare Workers.**
 
 [![Cloudflare Workers](https://img.shields.io/badge/Cloudflare-Workers-F38020?style=flat&logo=cloudflare&logoColor=white)](https://workers.cloudflare.com/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?style=flat&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
@@ -16,17 +16,18 @@
 ## 📖 Table of Contents
 
 - [Overview](#overview)
+- [2026-06-27 Migration Notice](#2026-06-27-migration-notice)
 - [Architecture](#architecture)
 - [Environment Variables](#environment-variables)
 - [Deployment](#deployment)
 - [API Reference](#api-reference)
   - [Public Routes](#public-routes)
   - [Search](#post-search)
-  - [Info](#get-infosubjectid)
-  - [Season](#get-seasonsubjectid)
-  - [Stream](#get-streamsubjectid)
-  - [Stream All](#get-streamsubjectidall)
-  - [Download](#get-downloadsubjectid)
+  - [Info](#get-infosubjectiddetailpath)
+  - [Season](#get-seasonsubjectiddetailpath)
+  - [Stream](#get-streamsubjectiddetailpath)
+  - [Stream All](#get-streamsubjectidalldetailpath)
+  - [Download](#get-downloadsubjectiddetailpath)
   - [Home](#get-home)
   - [Home Rows](#get-homerows)
   - [Home Subjects](#get-homesubjectsopidx)
@@ -39,12 +40,23 @@
 
 ## Overview
 
-This worker wraps two separate MovieBox API surfaces — the **Android mobile API** and the **H5 web API** — into a single, clean REST interface.
-
-- The **Android API** powers search, info, season structure, and stream/download endpoints. It uses a 7-host pool with automatic fallback and HMAC-MD5 request signing to authenticate requests.
-- The **H5 web API** powers the homepage feed endpoints. No signing required — just the right headers and a Nigerian IP hint to get the Africa-region feed.
+This worker wraps the **MovieBox H5 web API** into a single, clean REST interface — search, subject detail, season structure, streaming, downloads, captions, and the homepage feed, all from one consistent auth scheme.
 
 All routes except `/` and `/health` are protected by an `X-Worker-Secret` header.
+
+---
+
+## 2026-06-27 Migration Notice
+
+This worker previously ran on the **MovieBox Android mobile API** (a 7-host pool, HMAC-MD5 signed). That pool started uniformly rejecting every request with HTTP 440/530 across all 7 hosts — confirmed live via `wrangler tail`, not a transient blip. This is consistent with MovieBox having broken or rotated something in that signing scheme upstream, with no fix available short of a maintainer re-reverse-engineering it.
+
+**Every route has been rewritten to run on the H5 web API instead** (`h5-api.aoneroom.com` / `h5.aoneroom.com`), which needs no HMAC signing at all — just a bootstrapped session token. This was the same API surface already powering `/home`, so it's a known-stable foundation, not a new unknown.
+
+**What changed for API consumers:**
+
+- ✅ `/search`, `/stream`, `/stream/:id/all`, `/download`, `/home*` — **same response shape as before**, no breaking changes.
+- ⚠️ `/info` and `/season` now require an additional **`?detailPath=`** query param. The H5 API has no JSON lookup for subject details by ID alone — detail data is extracted from the subject's actual web page, which is addressed by `detailPath` (e.g. `"avatar-WLDIi21IUBa"`), not `subjectId`. Every `/search` and `/home/subjects` response already includes `detailPath` on each item — pass it straight through. Calling either route without it now returns a clear `400` explaining why, instead of a confusing failure.
+- 🎉 **New:** `/stream` and `/stream/:id/all` responses now include a `captions` array — direct, signed `.srt` subtitle URLs sourced straight from MovieBox, no separate subtitle provider needed for anything MovieBox already has covered.
 
 ---
 
@@ -56,21 +68,31 @@ Client Request
       ▼
 Cloudflare Worker (src/index.ts)
       │
-      ├── Android Routes (search, info, season, stream, download)
+      ├── H5 Session (src/h5session.ts)
       │         │
-      │         └── fetchWithHostPool() → 7-host pool with sequential fallback
-      │                   │               + HMAC-MD5 signing (src/signing.ts)
-      │                   └── api6.aoneroom.com
-      │                       api5.aoneroom.com
-      │                       api4.aoneroom.com
-      │                       api4sg.aoneroom.com
-      │                       api3.aoneroom.com
-      │                       api6sg.aoneroom.com
-      │                       api.inmoviebox.com
+      │         └── Bootstrap handshake → search-suggest endpoint
+      │                   │                returns x-user header (JWT) + cookies
+      │                   └── Cached in-memory per isolate, re-bootstrapped
+      │                       automatically when the JWT nears expiry
       │
-      └── H5 Routes (home, home/rows, home/subjects)
+      ├── Search / Stream / Download (src/moviebox.ts)
+      │         │
+      │         ├── h5-api.aoneroom.com/.../subject/search
+      │         └── h5.aoneroom.com/wefeed-h5-bff/web/subject/download
+      │                   (single episode per call — se=0&ep=0 for movies)
+      │
+      ├── Info / Season (src/moviebox.ts + src/nuxtExtract.ts)
+      │         │
+      │         └── Fetch h5.aoneroom.com/movies/{detailPath}?id={subjectId}
+      │                   │
+      │                   └── Extract & resolve the page's embedded
+      │                       __NUXT_DATA__ payload (Nuxt's devalue-style
+      │                       flat reference array) to recover subject,
+      │                       season, and cast data
+      │
+      └── Home Routes (UNCHANGED — already on H5, unaffected by the migration)
                 │
-                └── fetchH5Home() → 2-host fallback, no signing
+                └── fetchH5Home() → 3-host fallback, no signing
                           │         + X-Forwarded-For Nigerian IP pin
                           └── netnaija.film (primary)
                               h5.aoneroom.com
@@ -79,19 +101,19 @@ Cloudflare Worker (src/index.ts)
 
 ### Why the Nigerian IP pin?
 
-The H5 upstream server returns different homepage feeds based on the requester's IP geolocation. Cloudflare edge nodes have US/EU IPs and receive a truncated 30-row feed. By sending `X-Forwarded-For` with a Nigerian IP via the `NIGERIA_IP` environment variable, the upstream returns the full 35-row Africa region feed — including the Nollywood, Football Highlights, and Must-watch Black Shows rows.
+The H5 home upstream returns different homepage feeds based on the requester's IP geolocation. Cloudflare edge nodes have US/EU IPs and receive a truncated 30-row feed. By sending `X-Forwarded-For` with a Nigerian IP via the `NIGERIA_IP` environment variable, the upstream returns the full 35-row Africa region feed — including the Nollywood, Football Highlights, and Must-watch Black Shows rows.
 
-### The `se=0&ep=0` trick
+### Why the bootstrap handshake?
 
-The Android resource endpoint returns all episodes in bulk when you pass `se=0` and `ep=0`. Individual episode filtering then happens in the worker. This was the key discovery that made the stream and download endpoints work.
+The H5 API has no API-key or HMAC auth — instead, a POST to its search-suggest endpoint returns a short-lived JWT (in an `x-user` response header) plus session cookies. Every subsequent authenticated request needs both attached. The worker bootstraps once per isolate lifetime and re-bootstraps automatically once the JWT is close to expiring, or immediately if an upstream call comes back with an auth-style rejection.
 
-### Why `perPage: 10`?
+### Why is `/stream` single-episode only?
 
-The Android resource endpoint silently rejects `perPage` values above 10 by returning API `code !== 0`, causing `fetchWithHostPool` to exhaust all 7 hosts and return null. The worker always sends `perPage: 10` and paginates properly via the `hasMore` flag.
+Confirmed via direct testing: passing `se=0&ep=0` (the old "bulk" trick) against a TV series subjectId on the H5 download endpoint returns `hasResource: false` — there's no native bulk mode here. `/stream/:id/all` and `/download` therefore loop over each episode themselves and aggregate the results, the same approach as before, just hitting the new upstream per call instead of the old Android one.
 
-### Why loop over resolutions?
+### Why does `/info`/`/season` need `detailPath`?
 
-The Android resource endpoint is resolution-filtered by default. Without passing a `resolution` param the server returns only one quality. The worker loops over `[360, 480, 720, 1080]` and makes a separate paginated request per resolution, deduplicating by `resourceId` across passes to build the full multi-quality pack.
+Unlike search or download, MovieBox's H5 API has no JSON endpoint for subject details — that data only exists embedded in the subject's actual detail **page** HTML (a Nuxt.js app), addressed by `detailPath`, not `subjectId`. The worker fetches that page and extracts the embedded `__NUXT_DATA__` payload — a flat, deduplicated reference array (Nuxt's "devalue" serialization) — then walks the reference chain to recover the real `subject`, `resource.seasons`, and `stars` (cast) objects. This was verified by hand against a real page before being implemented, including resolving cast member references to confirm the walk was correct end-to-end.
 
 ---
 
@@ -198,7 +220,7 @@ curl -s "https://your-worker.workers.dev/"
 {
   "name": "Spün MovieBox API",
   "description": "An unofficial REST API built by Spün for MovieBox...",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "routes": [ ... ]
 }
 ```
@@ -246,68 +268,71 @@ curl -s -X POST "https://your-worker.workers.dev/search" \
 {
   "items": [
     {
-      "subjectId": "1654274595068805784",
+      "subjectId": "8906247916759695608",
       "subjectType": 1,
-      "title": "Avatar [Hindi]",
+      "title": "Avatar",
       "type": "movie",
       "releaseDate": "2009-12-18",
-      "duration": "2h 42m",
-      "genre": "Action, Adventure, Fantasy",
-      "poster": "https://pbcdn.aoneroom.com/image/...",
+      "duration": 9720,
+      "genre": "Action,Adventure,Fantasy",
+      "poster": "https://pbcdnw.aoneroom.com/image/...",
       "rating": 7.9,
-      "language": "English, Spanish",
-      "country": "United States"
+      "language": null,
+      "country": "United States",
+      "detailPath": "avatar-WLDIi21IUBa"
     }
   ],
   "pager": {
     "hasMore": true,
     "page": "1",
     "perPage": 20,
-    "totalCount": 200
+    "totalCount": 79
   }
 }
 ```
 
+> **Note:** `detailPath` is a new field on each item — required for `/info` and `/season`. Carry it through wherever you store subject data.
+
 ---
 
-### `GET /info/:subjectId`
+### `GET /info/:subjectId?detailPath=`
 
-Get full detail for a subject including staff list.
+Get full detail for a subject including cast list. **Requires `detailPath`** — see the [migration notice](#2026-06-27-migration-notice).
 
 ```bash
-curl -s "https://your-worker.workers.dev/info/1654274595068805784" \
+curl -s "https://your-worker.workers.dev/info/8906247916759695608?detailPath=avatar-WLDIi21IUBa" \
   -H "X-Worker-Secret: your_secret"
 ```
 
 ```json
 {
-  "subjectId": "1654274595068805784",
+  "subjectId": "8906247916759695608",
   "subjectType": 1,
   "type": "movie",
-  "title": "Avatar [Hindi]",
+  "title": "Avatar",
   "description": "A paraplegic Marine dispatched to the moon Pandora...",
   "releaseDate": "2009-12-18",
   "runtime": 162,
-  "genre": "Action, Adventure, Fantasy",
-  "poster": "https://pbcdn.aoneroom.com/image/...",
+  "genre": "Action,Adventure,Fantasy",
+  "poster": "https://pbcdnw.aoneroom.com/image/...",
   "country": "United States",
   "rating": 7.9,
   "hasResource": true,
-  "language": "English, Spanish",
+  "language": null,
   "staff": [
-    { "name": "James Cameron", "role": "Director", "avatar": null }
+    { "name": "Sam Worthington", "role": "Jake Sully", "avatar": "https://pbcdnw.aoneroom.com/image/..." }
   ]
 }
 ```
 
 ---
 
-### `GET /season/:subjectId`
+### `GET /season/:subjectId?detailPath=`
 
-Get season and episode structure for a TV show or shorts series. The `episodesAvailable` field reflects the highest episode count across all available resolutions.
+Get season and episode structure for a TV show or shorts series. **Requires `detailPath`**. The `episodesAvailable` field reflects the highest episode count across all available resolutions.
 
 ```bash
-curl -s "https://your-worker.workers.dev/season/5139196938264400928" \
+curl -s "https://your-worker.workers.dev/season/7850278583678682192?detailPath=avatar-the-last-airbender-YoJu6LgmUl9" \
   -H "X-Worker-Secret: your_secret"
 ```
 
@@ -334,24 +359,25 @@ curl -s "https://your-worker.workers.dev/season/5139196938264400928" \
 
 ---
 
-### `GET /stream/:subjectId`
+### `GET /stream/:subjectId?detailPath=`
 
-Stream URLs for a specific episode, one URL per quality.
+Stream URLs (+ captions) for a specific episode, one URL per quality.
 
 **Query Params:**
 
-| Param | Description |
-|-------|-------------|
-| `se` | Season number. Use `0` for movies. |
-| `ep` | Episode number. Use `0` for movies. |
+| Param | Required | Description |
+|-------|----------|-------------|
+| `se` | ❌ (default `0`) | Season number. Use `0` for movies. |
+| `ep` | ❌ (default `0`) | Episode number. Use `0` for movies. |
+| `detailPath` | ✅ | Subject's detail path, from `/search` or `/home/subjects`. |
 
 ```bash
 # Movie
-curl -s "https://your-worker.workers.dev/stream/1654274595068805784?se=0&ep=0" \
+curl -s "https://your-worker.workers.dev/stream/8906247916759695608?se=0&ep=0&detailPath=avatar-WLDIi21IUBa" \
   -H "X-Worker-Secret: your_secret"
 
 # TV Episode
-curl -s "https://your-worker.workers.dev/stream/5139196938264400928?se=5&ep=8" \
+curl -s "https://your-worker.workers.dev/stream/7850278583678682192?se=1&ep=1&detailPath=avatar-the-last-airbender-YoJu6LgmUl9" \
   -H "X-Worker-Secret: your_secret"
 ```
 
@@ -361,42 +387,32 @@ curl -s "https://your-worker.workers.dev/stream/5139196938264400928?se=5&ep=8" \
     {
       "quality": "1080p",
       "resolution": 1080,
-      "url": "https://bcdn.hakunaymatata.com/resource/....mp4?sign=...&t=...",
+      "url": "https://bcdnxw.hakunaymatata.com/resource/....mp4?sign=...&t=...",
       "format": "mp4",
-      "size": "426 MB",
-      "codecName": "hevc",
-      "duration": 4005,
-      "captions": [],
-      "se": 5,
-      "ep": 8
-    },
-    {
-      "quality": "480p",
-      "resolution": 480,
-      "url": "https://bcdn.hakunaymatata.com/resource/....mp4?sign=...&t=...",
-      "format": "mp4",
-      "size": "211 MB",
-      "codecName": "hevc",
-      "duration": 4005,
-      "captions": [],
-      "se": 5,
-      "ep": 8
+      "size": "619 MB"
     }
   ],
-  "total": 3
+  "total": 4,
+  "captions": [
+    {
+      "language": "English",
+      "language_code": "en",
+      "url": "https://cacdn.hakunaymatata.com/subtitle/....srt?Policy=...&Signature=...&Key-Pair-Id=..."
+    }
+  ]
 }
 ```
 
-> **Note:** Stream URLs are signed and time-limited by the upstream CDN. Fetch them fresh on each playback session — do not cache the URLs themselves.
+> **Note:** Stream and caption URLs are signed and time-limited by the upstream CDN. Fetch them fresh on each playback session — do not cache the URLs themselves.
 
 ---
 
-### `GET /stream/:subjectId/all`
+### `GET /stream/:subjectId/all?detailPath=`
 
-All stream URLs for every episode, grouped by season → episode. Designed for shorts series bulk fetch and full series prefetch. No `se`/`ep` filtering — always returns the complete pack.
+All stream URLs (+ captions) for every episode, grouped by season → episode. The H5 download endpoint is strictly single-episode, so this loops internally and aggregates — sequentially, not in parallel, to stay within Workers' subrequest limits on long series.
 
 ```bash
-curl -s "https://your-worker.workers.dev/stream/7618577843911803416/all" \
+curl -s "https://your-worker.workers.dev/stream/7850278583678682192/all?detailPath=avatar-the-last-airbender-YoJu6LgmUl9" \
   -H "X-Worker-Secret: your_secret"
 ```
 
@@ -409,20 +425,12 @@ curl -s "https://your-worker.workers.dev/stream/7618577843911803416/all" \
         {
           "episode": 1,
           "streams": [
-            {
-              "quality": "720p",
-              "resolution": 720,
-              "url": "https://bcdn.hakunaymatata.com/...",
-              "format": "mp4",
-              "size": "53 MB",
-              "codecName": "h264",
-              "duration": 1420,
-              "captions": [],
-              "se": 1,
-              "ep": 1
-            }
+            { "quality": "720p", "resolution": 720, "url": "https://bcdnxw.hakunaymatata.com/...", "format": "mp4", "size": "385 MB" }
           ],
-          "total": 1
+          "total": 1,
+          "captions": [
+            { "language": "English", "language_code": "en", "url": "https://cacdn.hakunaymatata.com/..." }
+          ]
         }
       ]
     }
@@ -433,12 +441,12 @@ curl -s "https://your-worker.workers.dev/stream/7618577843911803416/all" \
 
 ---
 
-### `GET /download/:subjectId`
+### `GET /download/:subjectId?detailPath=`
 
-Full download pack grouped by season → episode → qualities. Same as `/stream/all` but intended for download managers — the `qualities` key name makes the intent clearer.
+Full download pack grouped by season → episode → qualities. Same underlying data as `/stream/all` but reshaped — the `qualities` key name makes the intent clearer for download managers.
 
 ```bash
-curl -s "https://your-worker.workers.dev/download/5139196938264400928" \
+curl -s "https://your-worker.workers.dev/download/7850278583678682192?detailPath=avatar-the-last-airbender-YoJu6LgmUl9" \
   -H "X-Worker-Secret: your_secret"
 ```
 
@@ -451,24 +459,13 @@ curl -s "https://your-worker.workers.dev/download/5139196938264400928" \
         {
           "episode": 1,
           "qualities": [
-            {
-              "quality": "1080p",
-              "resolution": 1080,
-              "url": "https://bcdn.hakunaymatata.com/...",
-              "format": "mp4",
-              "size": "360 MB",
-              "codecName": "hevc",
-              "duration": 3609,
-              "captions": [],
-              "se": 1,
-              "ep": 1
-            }
+            { "quality": "1080p", "resolution": 1080, "url": "https://bcdnxw.hakunaymatata.com/...", "format": "mp4", "size": "649 MB" }
           ]
         }
       ]
     }
   ],
-  "total_seasons": 5
+  "total_seasons": 1
 }
 ```
 
@@ -476,7 +473,7 @@ curl -s "https://your-worker.workers.dev/download/5139196938264400928" \
 
 ### `GET /home`
 
-Full MovieBox homepage with all rows and their subjects. Africa/Lagos region feed — includes Nollywood, Anime Dubbed, Hot Short TV, Must-watch Black Shows, and more.
+Full MovieBox homepage with all rows and their subjects. Africa/Lagos region feed — includes Nollywood, Anime Dubbed, Hot Short TV, Must-watch Black Shows, and more. **Unchanged by the migration.**
 
 ```bash
 curl -s "https://your-worker.workers.dev/home" \
@@ -485,7 +482,7 @@ curl -s "https://your-worker.workers.dev/home" \
 
 ```json
 {
-  "total": 35,
+  "total": 45,
   "rows": [
     {
       "title": "Nollywood Movie",
@@ -499,7 +496,8 @@ curl -s "https://your-worker.workers.dev/home" \
           "type": "movie",
           "title": "YOURS BEFORE WORDS",
           "poster": "https://pbcdnw.aoneroom.com/image/...",
-          "hasResource": true
+          "hasResource": true,
+          "detailPath": "yours-before-words-xxxxxxxxx"
         }
       ]
     }
@@ -511,7 +509,7 @@ curl -s "https://your-worker.workers.dev/home" \
 
 ### `GET /home/rows`
 
-Lightweight endpoint — returns just row titles and opIds. Use this first to discover which rows exist and their opIds before fetching subjects. opIds change dynamically so do not hardcode them.
+Lightweight endpoint — returns just row titles and opIds. Use this first to discover which rows exist and their opIds before fetching subjects. opIds change dynamically so do not hardcode them. **Unchanged by the migration.**
 
 ```bash
 curl -s "https://your-worker.workers.dev/home/rows" \
@@ -520,7 +518,7 @@ curl -s "https://your-worker.workers.dev/home/rows" \
 
 ```json
 {
-  "total": 35,
+  "total": 45,
   "rows": [
     { "title": "Nollywood Movie", "opId": "359580746379676048" },
     { "title": "Anime[English Dubbed]", "opId": "5992193223496810920" },
@@ -534,7 +532,7 @@ curl -s "https://your-worker.workers.dev/home/rows" \
 
 ### `GET /home/subjects?opId=X`
 
-Subjects for a specific homepage row identified by `opId`.
+Subjects for a specific homepage row identified by `opId`. **Unchanged by the migration.**
 
 **Query Params:**
 
@@ -567,7 +565,8 @@ curl -s "https://your-worker.workers.dev/home/subjects?opId=359580746379676048" 
       "country": "Nigeria",
       "rating": null,
       "hasResource": true,
-      "language": null
+      "language": null,
+      "detailPath": "yours-before-words-xxxxxxxxx"
     }
   ]
 }
@@ -589,7 +588,11 @@ All other subject types are filtered out from responses.
 
 ## Known Quirks
 
-**Signed, time-limited stream URLs** — CDN URLs from the resource endpoint include a `sign` param and a `t` (timestamp) param. They expire. Always fetch fresh from `/stream` at playback time.
+**`detailPath` is now mandatory for `/info`, `/season`, `/stream`, `/stream/all`, and `/download`** — MovieBox's H5 API has no by-ID JSON lookup for subject detail data; it only exists embedded in the subject's web page, which is addressed by `detailPath`. Every `/search` and `/home/subjects` response already includes it.
+
+**Signed, time-limited stream and caption URLs** — CDN URLs include a `sign`/`Signature` param and a `t`/expiry param. They expire. Always fetch fresh from `/stream` at playback time, including for subtitles.
+
+**`/stream` is strictly single-episode upstream** — confirmed via direct testing: there is no native "all episodes in one call" mode on the H5 download endpoint (unlike the old Android resource endpoint's `se=0&ep=0` bulk trick). `/stream/:id/all` and `/download` loop over episodes internally to compensate.
 
 **Shorts are structured like TV** — Despite being short-form vertical content, shorts subjects use `se=1` and a flat episode list under season 1. Use `/stream/:id?se=1&ep=X` for individual episodes or `/stream/:id/all` for the full pack.
 
@@ -597,13 +600,15 @@ All other subject types are filtered out from responses.
 
 **Resolution availability varies** — Not every episode is available in every quality. The `resolutions[].epNum` field in `/season` tells you exactly how many episodes exist per quality tier.
 
+**Session tokens are cached in-memory per Worker isolate** — not in Workers KV. This keeps the implementation simple, since re-bootstrapping is cheap and infrequent (JWTs observed to be long-lived), but means a cold start triggers one extra bootstrap request before the first real call succeeds.
+
 ---
 
 ## Acknowledgements
 
-**[moviebox-api](https://github.com/Simatwa/moviebox-api) by Simatwa** — The foundation this worker is built on. The host pool URLs (both Android mobile and H5 web), the request signing algorithm, and the API endpoint structure were all discovered through their Python library. None of this would have been possible without their reverse engineering work.
+**[moviebox-api](https://github.com/Simatwa/moviebox-api) by Simatwa** — The foundation this worker is built on. The H5 web API's endpoints, the search-suggest auth handshake, and the `__NUXT_DATA__` detail-page extraction approach were all discovered through studying their Python library's v1/v2 implementation, after the older Android-API-based approach (also originally sourced from this project) was broken upstream.
 
-**[Claude by Anthropic](https://claude.ai)** — Instrumental in building, debugging, and iterating on this worker across multiple sessions. From diagnosing the `perPage: 10` upstream quirk that was silently breaking every stream/download request, to figuring out the `se=0&ep=0` bulk fetch pattern, to tracking down the Nigerian IP geolocation issue that was truncating the home feed — Claude was a genuine engineering partner throughout.
+**[Claude by Anthropic](https://claude.ai)** — Instrumental in diagnosing the Android pool's failure via live `wrangler tail` logs, reverse-engineering the H5 session bootstrap and `__NUXT_DATA__` payload structure by hand against real responses before writing a single line of the new client, and rebuilding the worker's request layer end-to-end while preserving every existing route's response contract for other projects depending on this API.
 
 ---
 
