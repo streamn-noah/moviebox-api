@@ -1,53 +1,329 @@
 // src/moviebox.ts
-// MovieBox H5 Web API client for Cloudflare Workers.
+// MovieBox Mobile API client for Cloudflare Workers.
+// Handles host pool fallback, request signing, auth token bootstrap, and all
+// endpoint calls.
 //
-// REPLACES the old Android mobile-app client (HMAC-signed, 7-host pool).
-// As of testing on 2026-06-27, every host in that pool uniformly rejects
-// requests with HTTP 440/530 — MovieBox appears to have broken or rotated
-// something in that signing scheme upstream. The H5 web API (used here)
-// is a separate, working pool that needs no signing at all — just a
-// bootstrapped session token (see h5session.ts) and a couple of headers.
-//
-// Confirmed working during testing:
-//   - search           -> h5-api.aoneroom.com/wefeed-h5api-bff/subject/search
-//   - stream/download   -> h5.aoneroom.com/wefeed-h5-bff/web/subject/download
-//   - info/season       -> h5.aoneroom.com/movies/{detailPath}?id={subjectId}
-//                          (HTML page, data extracted via nuxtExtract.ts)
-//
-// NOTE: the stream/download endpoint is STRICTLY single-episode — passing
-// se=0&ep=0 on a TV series subjectId returns hasResource:false, confirmed
-// by direct test. There is no upstream bulk mode. /stream/:id/all therefore
-// still works the same way it always did: the worker loops over episodes
-// itself and aggregates the results.
+// ─── 2026-06-29 fix ──────────────────────────────────────────────────────────
+// fetchWithHostPool now attaches an `Authorization: Bearer {token}` header to
+// every request, sourced from signing.ts's KV-backed cache. This was the
+// missing piece causing uniform 440/530 rejections across all 7 hosts — the
+// HMAC signing itself was always correct, but MovieBox now also requires a
+// bearer token obtained via a one-time bootstrap call. See signing.ts for
+// the full bootstrap flow and rationale.
 
-import { getAuthHeaders, invalidateSession } from './h5session.js';
-import { getInfoFromHtml, type MBNuxtPageData } from './nuxtExtract.js';
+import {
+  generateClientToken,
+  generateSignature,
+  getCachedAuthToken,
+  bootstrapAuthToken,
+  invalidateAuthToken,
+  type SigningEnv,
+} from './signing.js';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-const SEARCH_URL = 'https://h5-api.aoneroom.com/wefeed-h5api-bff/subject/search';
-const DOWNLOAD_URL = 'https://h5.aoneroom.com/wefeed-h5-bff/web/subject/download';
-const MOVIE_PAGE_BASE = 'https://h5.aoneroom.com/movies';
+export const HOST_POOL = [
+  'https://api6.aoneroom.com',
+  'https://api5.aoneroom.com',
+  'https://api4.aoneroom.com',
+  'https://api4sg.aoneroom.com',
+  'https://api3.aoneroom.com',
+  'https://api6sg.aoneroom.com',
+  'https://api.inmoviebox.com',
+];
 
-const REQUEST_TIMEOUT_MS = 12000;
+const VERSION_CODE = 50020044;
+const VERSION_NAME = '3.0.03.0529.03';
+const ANDROID_VERSION = '13';
+const ANDROID_BUILD = 'TQ2A.230405.003';
+const DEVICE_MODEL = '23078RKD5C';
+const DEVICE_BRAND = 'Redmi';
 
-// ─── Raw API response shapes (H5) ─────────────────────────────────────────────
+const USER_AGENT =
+  `com.community.oneroom/${VERSION_CODE} ` +
+  `(Linux; U; Android ${ANDROID_VERSION}; en_US; ` +
+  `${DEVICE_MODEL}; Build/${ANDROID_BUILD}; Cronet/135.0.7012.3)`;
+
+// ─── Paths ────────────────────────────────────────────────────────────────────
+
+export const PATHS = {
+  search:     '/wefeed-mobile-bff/subject-api/search',
+  get:        '/wefeed-mobile-bff/subject-api/get',
+  seasonInfo: '/wefeed-mobile-bff/subject-api/season-info',
+  resource:   '/wefeed-mobile-bff/subject-api/resource',
+  captions:   '/wefeed-mobile-bff/subject-api/get-ext-captions',
+  // Lightweight bootstrap target — any signed GET works, this is the
+  // smallest/cheapest one. Not used for actual homepage data (that's H5).
+  tabOperating: '/wefeed-mobile-bff/tab-operating',
+};
+
+// ─── Client identity ──────────────────────────────────────────────────────────
+// Generated inside request handlers only — Cloudflare Workers forbid crypto
+// calls (getRandomValues, randomUUID) in the global/module scope.
+
+function makeClientInfo(): string {
+  const deviceId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+  const gaid = crypto.randomUUID();
+
+  return JSON.stringify({
+    package_name:    'com.community.oneroom',
+    version_name:    VERSION_NAME,
+    version_code:    VERSION_CODE,
+    os:              'android',
+    os_version:      ANDROID_VERSION,
+    install_ch:      'ps',
+    device_id:       deviceId,
+    install_store:   'ps',
+    gaid,
+    brand:           DEVICE_BRAND,
+    model:           DEVICE_MODEL,
+    system_language: 'en',
+    net:             'NETWORK_WIFI',
+    region:          'US',
+    timezone:        'America/New_York',
+    sp_code:         '40401',
+    'X-Play-Mode':   '2',
+  });
+}
+
+// Lazily cached per isolate lifetime — set on first request, reused after.
+// Never called at module load time so global scope restriction is not triggered.
+let _clientInfo: string | null = null;
+function getClientInfo(): string {
+  if (!_clientInfo) _clientInfo = makeClientInfo();
+  return _clientInfo;
+}
+
+// ─── Signed headers builder ───────────────────────────────────────────────────
+
+async function buildHeaders(
+  method: string,
+  url: string,
+  body: string | null = null,
+  authToken: string | null = null
+): Promise<Record<string, string>> {
+  const accept = 'application/json';
+  const contentType = body !== null ? 'application/json; charset=utf-8' : 'application/json';
+  const ts = Date.now();
+
+  const [token, signature] = await Promise.all([
+    generateClientToken(ts),
+    generateSignature(method, accept, contentType, url, body, ts),
+  ]);
+
+  const headers: Record<string, string> = {
+    'User-Agent':      USER_AGENT,
+    'Accept':          accept,
+    'Content-Type':    contentType,
+    'Connection':      'keep-alive',
+    'X-Client-Token':  token,
+    'x-tr-signature':  signature,
+    'X-Client-Info':   getClientInfo(),
+    'X-Client-Status': '0',
+    'X-Play-Mode':     '2',
+  };
+
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`;
+  }
+
+  return headers;
+}
+
+// ─── Raw, single-attempt host-pool fetch ──────────────────────────────────────
+// Tries each host in order with the given auth token attached, returning the
+// first successful response along with the x-user header (if present) so the
+// caller can absorb a fresh/rotated token.
+
+interface HostPoolAttemptResult<T> {
+  data: T | null;
+  freshXUserToken: string | null;
+  /** True if every host rejected specifically due to auth (401/403, or an
+   *  API-level "invalid token" style code) rather than other errors — signals
+   *  the caller should bootstrap a new token and retry once. */
+  authFailure: boolean;
+}
+
+function extractXUserToken(response: Response): string | null {
+  const xUser = response.headers.get('x-user');
+  if (!xUser) return null;
+  try {
+    const payload = JSON.parse(xUser) as { token?: string };
+    return payload.token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function attemptHostPool<T>(
+  path: string,
+  method: 'GET' | 'POST',
+  params: Record<string, string | number> | undefined,
+  bodyStr: string | null,
+  authToken: string | null
+): Promise<HostPoolAttemptResult<T>> {
+  let freshXUserToken: string | null = null;
+  let sawAuthFailure = false;
+  let sawAnyResponse = false;
+
+  for (const base of HOST_POOL) {
+    const url = new URL(`${base}${path}`);
+    if (params) {
+      for (const [key, value] of Object.entries(params)) {
+        url.searchParams.set(key, String(value));
+      }
+    }
+
+    const urlStr = url.toString();
+    const headers = await buildHeaders(method, urlStr, bodyStr, authToken);
+
+    try {
+      const response = await fetch(urlStr, {
+        method,
+        headers,
+        body: bodyStr ?? undefined,
+        signal: AbortSignal.timeout(12000),
+      });
+
+      sawAnyResponse = true;
+
+      const xUserToken = extractXUserToken(response);
+      if (xUserToken) freshXUserToken = xUserToken;
+
+      if (response.status === 401 || response.status === 403) {
+        console.warn(`[MovieBox] Host ${base} returned ${response.status} (auth) — trying next`);
+        sawAuthFailure = true;
+        continue;
+      }
+
+      if (!response.ok) {
+        console.warn(`[MovieBox] Host ${base} returned ${response.status} — trying next`);
+        continue;
+      }
+
+      const data = await response.json() as { code: number; message?: string; data?: T };
+
+      if (data.code === 0) {
+        return { data: (data.data ?? null) as T | null, freshXUserToken, authFailure: false };
+      }
+
+      console.warn(`[MovieBox] Host ${base} returned API code ${data.code}: ${data.message ?? ''} — trying next`);
+      if (data.message && /token|auth/i.test(data.message)) {
+        sawAuthFailure = true;
+      }
+    } catch (err) {
+      console.warn(`[MovieBox] Host ${base} failed: ${err} — trying next`);
+    }
+  }
+
+  console.error(`[MovieBox] All ${HOST_POOL.length} hosts exhausted for ${path}`);
+  return {
+    data: null,
+    freshXUserToken,
+    // Only treat as a pure auth failure if we got real responses back (not
+    // just transport errors/timeouts) and at least one of them looked like
+    // an auth rejection — otherwise this is a genuine host outage, and
+    // retrying with a new token won't help.
+    authFailure: sawAnyResponse && sawAuthFailure,
+  };
+}
+
+// ─── Public host pool fetcher (auth-aware) ────────────────────────────────────
+// Tries each host in order, returning the first successful response.
+// Hosts are mirrors — they all serve the same data — so the first working
+// host is sufficient. Firing all hosts simultaneously wastes quota and can
+// trigger rate-limits on the upstream API.
+//
+// Handles the full auth lifecycle: reuses a cached token if we have one,
+// bootstraps a fresh one if we don't, retries once if every host rejected
+// for auth reasons, and absorbs any rotated token MovieBox hands back via
+// the x-user response header so future calls stay current without an extra
+// bootstrap round-trip.
+
+export async function fetchWithHostPool<T>(
+  env: SigningEnv,
+  path: string,
+  method: 'GET' | 'POST',
+  params?: Record<string, string | number>,
+  body?: Record<string, unknown>
+): Promise<T | null> {
+  const bodyStr = body ? JSON.stringify(body) : null;
+
+  let authToken = await getCachedAuthToken(env);
+
+  if (!authToken) {
+    try {
+      authToken = await bootstrapAuthToken(env, async () => {
+        const result = await attemptHostPool<unknown>(
+          PATHS.tabOperating,
+          'GET',
+          { page: 1, tabId: 0, version: '' },
+          null,
+          null
+        );
+        return result.freshXUserToken;
+      });
+    } catch (e) {
+      console.error(`[MovieBox] Auth bootstrap failed: ${e}`);
+      return null;
+    }
+  }
+
+  let result = await attemptHostPool<T>(path, method, params, bodyStr, authToken);
+
+  // Absorb any rotated token immediately, regardless of whether this
+  // particular call succeeded — keeps the cache current for next time.
+  if (result.freshXUserToken && result.freshXUserToken !== authToken) {
+    await bootstrapAuthToken(env, async () => result.freshXUserToken).catch(() => {});
+  }
+
+  if (result.data !== null) {
+    return result.data;
+  }
+
+  if (result.authFailure) {
+    console.warn(`[MovieBox] Auth failure on ${path} — invalidating token and retrying once`);
+    await invalidateAuthToken(env);
+
+    try {
+      authToken = await bootstrapAuthToken(env, async () => {
+        const bootstrapResult = await attemptHostPool<unknown>(
+          PATHS.tabOperating,
+          'GET',
+          { page: 1, tabId: 0, version: '' },
+          null,
+          null
+        );
+        return bootstrapResult.freshXUserToken;
+      });
+    } catch (e) {
+      console.error(`[MovieBox] Re-bootstrap after auth failure failed: ${e}`);
+      return null;
+    }
+
+    result = await attemptHostPool<T>(path, method, params, bodyStr, authToken);
+    return result.data;
+  }
+
+  return null;
+}
+
+// ─── Raw API response shapes ──────────────────────────────────────────────────
 
 export interface MBSearchItem {
-  subjectId: string;
-  subjectType: number;
-  title: string;
-  description?: string;
-  releaseDate?: string;
-  duration?: number;
-  genre?: string;
-  cover?: { url: string; thumbnail?: string };
-  countryName?: string;
+  subjectId:        string;
+  subjectType:      number;
+  title:            string;
+  description?:     string;
+  releaseDate?:     string;
+  duration?:        string;
+  genre?:           string;
+  cover?:           { url: string; thumbnail?: string };
+  countryName?:     string;
   imdbRatingValue?: string;
-  language?: string;
-  detailPath?: string;
-  hasResource?: boolean;
-  subtitles?: string;
+  language?:        string;
 }
 
 export interface MBSearchData {
@@ -55,156 +331,52 @@ export interface MBSearchData {
   items: MBSearchItem[];
 }
 
-export interface MBCaption {
-  id: string;
-  lan: string;
-  lanName: string;
-  url: string;
-  size?: string;
-  delay?: number;
+export interface MBDetailData {
+  // Response is flat — all fields at top level, no subject wrapper
+  subjectId:        string;
+  subjectType:      number;
+  title:            string;
+  description?:     string;
+  releaseDate?:     string;
+  duration?:        number | string;  // "2h 42m" string or seconds number
+  genre?:           string;
+  cover?:           { url: string };
+  countryName?:     string;
+  imdbRatingValue?: string;
+  hasResource?:     boolean;
+  language?:        string;
+  staffList?:       Array<{ name: string; role: string; avatar?: { url?: string } }>;
 }
 
-export interface MBDownloadItem {
-  id: string;
-  url: string;
-  resolution: number;
-  size?: string;
+export interface MBSeasonData {
+  subjectId?:  string;
+  subjectType?: number;
+  // Season number → se, episode count → maxEp, resolutions show per-quality ep counts
+  seasons?: Array<{
+    se:           number;
+    maxEp:        number;
+    allEp?:       string;
+    resolutions?: Array<{ resolution: number; epNum: number }>;
+  }>;
 }
 
-export interface MBDownloadData {
-  downloads: MBDownloadItem[];
-  captions: MBCaption[];
-  limited: boolean;
-  limitedCode?: string;
-  freeNum?: number;
-  hasResource: boolean;
+export interface MBResourceItem {
+  episode:            number;
+  title:              string;
+  resourceLink:       string;
+  linkType:           number;
+  size?:              string;
+  resourceId:         string;
+  resolution:         number;
+  codecName?:         string;
+  duration?:          number;
+  requireMemberType?: number;
+  extCaptions?:       Array<{ lan: string; lanName?: string; url: string }>;
+  se:                 number;
+  ep:                 number;
 }
 
-// ─── Generic authenticated H5 fetch helper ───────────────────────────────────
-// One retry on auth failure: if the upstream rejects our token (e.g. it was
-// revoked server-side before our locally-decoded expiry would suggest),
-// we invalidate the cached session and retry once with a fresh bootstrap
-// rather than failing the whole request outright.
-
-async function fetchH5Json<T>(
-  url: string,
-  options: { method?: 'GET' | 'POST'; body?: Record<string, unknown>; referer?: string } = {}
-): Promise<T | null> {
-  const { method = 'GET', body, referer } = options;
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const authHeaders = await getAuthHeaders();
-      const headers: Record<string, string> = { ...authHeaders };
-      if (referer) headers['Referer'] = referer;
-
-      const response = await fetch(url, {
-        method,
-        headers,
-        body: body ? JSON.stringify(body) : undefined,
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-
-      if (!response.ok) {
-        console.warn(`[MovieBox H5] ${url} returned HTTP ${response.status}`);
-        if (response.status === 401 || response.status === 403) {
-          invalidateSession();
-          continue; // retry once with a fresh session
-        }
-        return null;
-      }
-
-      const json = (await response.json()) as { code: number; message?: string; data?: T };
-
-      if (json.code !== 0) {
-        console.warn(`[MovieBox H5] ${url} returned API code ${json.code}: ${json.message}`);
-        // "invalid token" style errors come back as code !== 0, not HTTP 4xx,
-        // so we check the message too before giving up on this attempt.
-        if (json.message && /token/i.test(json.message)) {
-          invalidateSession();
-          continue;
-        }
-        return null;
-      }
-
-      return (json.data ?? null) as T | null;
-    } catch (err) {
-      console.warn(`[MovieBox H5] ${url} request failed: ${err}`);
-      return null;
-    }
-  }
-
-  console.error(`[MovieBox H5] ${url} failed after retry with fresh session`);
-  return null;
-}
-
-// ─── Public client functions ──────────────────────────────────────────────────
-
-export async function searchMovieBox(
-  keyword: string,
-  page: number,
-  perPage: number
-): Promise<MBSearchData | null> {
-  return fetchH5Json<MBSearchData>(SEARCH_URL, {
-    method: 'POST',
-    body: { keyword, page, perPage, subjectType: 0 },
-  });
-}
-
-/**
- * Fetches stream/download URLs + captions for a single episode (or a movie,
- * using se=0&ep=0). This single upstream call backs all three of the
- * worker's /stream, /stream/:id/all (looped), and /download routes.
- */
-export async function getDownload(
-  subjectId: string,
-  se: number,
-  ep: number,
-  detailPath: string
-): Promise<MBDownloadData | null> {
-  const url = `${DOWNLOAD_URL}?subjectId=${encodeURIComponent(subjectId)}&se=${se}&ep=${ep}`;
-  const referer = `${MOVIE_PAGE_BASE}/${detailPath}`;
-  return fetchH5Json<MBDownloadData>(url, { referer });
-}
-
-/**
- * Fetches and extracts the full detail-page payload (subject info, seasons,
- * cast) for a subject by scraping its H5 detail page's embedded Nuxt state.
- * Unlike the other H5 calls, this isn't a JSON API endpoint — it parses real
- * HTML — so failures here are reported with more context than a flat null.
- */
-export async function getSubjectPageData(
-  subjectId: string,
-  detailPath: string
-): Promise<MBNuxtPageData | null> {
-  const url = `${MOVIE_PAGE_BASE}/${detailPath}?id=${encodeURIComponent(subjectId)}`;
-
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const authHeaders = await getAuthHeaders();
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: authHeaders,
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-
-      if (!response.ok) {
-        console.warn(`[MovieBox H5] Page fetch ${url} returned HTTP ${response.status}`);
-        if (response.status === 401 || response.status === 403) {
-          invalidateSession();
-          continue;
-        }
-        return null;
-      }
-
-      const html = await response.text();
-      return getInfoFromHtml(html);
-    } catch (err) {
-      console.warn(`[MovieBox H5] Page fetch/extraction failed for ${url}: ${err}`);
-      return null;
-    }
-  }
-
-  console.error(`[MovieBox H5] Page fetch failed after retry for ${url}`);
-  return null;
+export interface MBResourceData {
+  pager: { hasMore: boolean; totalCount: number; nextPage?: string; page?: string; perPage?: number };
+  list:  MBResourceItem[];
 }

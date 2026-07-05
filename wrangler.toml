@@ -8,6 +8,19 @@ NIGERIA_IP = "197.211.52.65"
 # Set MOVIEBOX_SECRET via: wrangler secret put MOVIEBOX_SECRET
 # This must match MOVIEBOX_WORKER_SECRET in your D.Verse backend env
 
+# Auth token cache for the mobile Android API (see signing.ts). Required as
+# of the 2026-06-29 fix — MovieBox now requires a bearer token (obtained via
+# a one-time bootstrap call) on top of the existing HMAC signing. Cached in
+# KV rather than memory since Cloudflare does not reliably reuse the same
+# isolate across requests. If you already created this namespace for the H5
+# worker variant, reuse the same id here — same KV store, different key.
+# Create with:
+#   wrangler kv namespace create MOVIEBOX_SESSION_KV
+# then paste the returned id below.
+[[kv_namespaces]]
+binding = "MOVIEBOX_SESSION_KV"
+id = "45023d6cda8b4139809d0c88af0bb69b"
+
 [[routes]]
 # Update with your actual Cloudflare zone if using custom domain
 pattern = "moviebox.byspun.xyz/*"
