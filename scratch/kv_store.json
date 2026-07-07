@@ -1,0 +1,3 @@
+{
+  "mobile_auth_token": "{\"token\":\"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjQxNzQ1NDE1MTcwNTIzMzU5NTIsImV4cCI6MTc5MTI0Mzg3MiwiaWF0IjoxNzgzNDY3NTcyfQ.ZFWTS_S0QuVaEidnPsGXcs9x5NnLJ1FOG1Nz-y584dM\",\"expiresAtSeconds\":2147483647,\"deviceId\":\"f4e1adf0878f7747b1773460b120dea2\",\"gaid\":\"6cac136a-fd9c-43b7-906a-4d3716658fb0\",\"bootstrapIp\":\"105.113.77.237\"}"
+}

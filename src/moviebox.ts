@@ -61,11 +61,11 @@ export const PATHS = {
 // Generated inside request handlers only — Cloudflare Workers forbid crypto
 // calls (getRandomValues, randomUUID) in the global/module scope.
 
-function makeClientInfo(): string {
-  const deviceId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+function makeClientInfo(customDeviceId?: string, customGaid?: string): string {
+  const deviceId = customDeviceId || Array.from(crypto.getRandomValues(new Uint8Array(16)))
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
-  const gaid = crypto.randomUUID();
+  const gaid = customGaid || crypto.randomUUID();
 
   return JSON.stringify({
     package_name:    'com.community.oneroom',
@@ -91,7 +91,10 @@ function makeClientInfo(): string {
 // Lazily cached per isolate lifetime — set on first request, reused after.
 // Never called at module load time so global scope restriction is not triggered.
 let _clientInfo: string | null = null;
-function getClientInfo(): string {
+function getClientInfo(deviceId?: string, gaid?: string): string {
+  if (deviceId && gaid) {
+    return makeClientInfo(deviceId, gaid);
+  }
   if (!_clientInfo) _clientInfo = makeClientInfo();
   return _clientInfo;
 }
@@ -102,7 +105,9 @@ async function buildHeaders(
   method: string,
   url: string,
   body: string | null = null,
-  authToken: string | null = null
+  authToken: string | null = null,
+  deviceId?: string,
+  gaid?: string
 ): Promise<Record<string, string>> {
   const accept = 'application/json';
   const contentType = body !== null ? 'application/json; charset=utf-8' : 'application/json';
@@ -120,7 +125,7 @@ async function buildHeaders(
     'Connection':      'keep-alive',
     'X-Client-Token':  token,
     'x-tr-signature':  signature,
-    'X-Client-Info':   getClientInfo(),
+    'X-Client-Info':   getClientInfo(deviceId, gaid),
     'X-Client-Status': '0',
     'X-Play-Mode':     '2',
   };
@@ -162,7 +167,10 @@ async function attemptHostPool<T>(
   method: 'GET' | 'POST',
   params: Record<string, string | number> | undefined,
   bodyStr: string | null,
-  authToken: string | null
+  authToken: string | null,
+  nigeriaIp?: string,
+  deviceId?: string,
+  gaid?: string
 ): Promise<HostPoolAttemptResult<T>> {
   let freshXUserToken: string | null = null;
   let sawAuthFailure = false;
@@ -177,7 +185,12 @@ async function attemptHostPool<T>(
     }
 
     const urlStr = url.toString();
-    const headers = await buildHeaders(method, urlStr, bodyStr, authToken);
+    const headers = await buildHeaders(method, urlStr, bodyStr, authToken, deviceId, gaid);
+    if (nigeriaIp) {
+      headers['X-Forwarded-For'] = nigeriaIp;
+    }
+    console.log(`[MovieBox Outgoing] URL: ${urlStr}`);
+    console.log(`[MovieBox Outgoing] Headers:`, JSON.stringify(headers));
 
     try {
       const response = await fetch(urlStr, {
@@ -250,18 +263,31 @@ export async function fetchWithHostPool<T>(
   body?: Record<string, unknown>
 ): Promise<T | null> {
   const bodyStr = body ? JSON.stringify(body) : null;
-
-  let authToken = await getCachedAuthToken(env);
+  const cached = await getCachedAuthToken(env);
+  const nigeriaIp = cached?.bootstrapIp || (env as any).NIGERIA_IP || '197.210.65.1';
+  let authToken = cached?.token ?? null;
+  let deviceId = cached?.deviceId ?? undefined;
+  let gaid = cached?.gaid ?? undefined;
 
   if (!authToken) {
+    deviceId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+    gaid = crypto.randomUUID();
+
     try {
-      authToken = await bootstrapAuthToken(env, async () => {
+      const finalDeviceId = deviceId;
+      const finalGaid = gaid;
+      authToken = await bootstrapAuthToken(env, finalDeviceId, finalGaid, async () => {
         const result = await attemptHostPool<unknown>(
           PATHS.tabOperating,
           'GET',
           { page: 1, tabId: 0, version: '' },
           null,
-          null
+          null,
+          nigeriaIp,
+          finalDeviceId,
+          finalGaid
         );
         return result.freshXUserToken;
       });
@@ -271,12 +297,14 @@ export async function fetchWithHostPool<T>(
     }
   }
 
-  let result = await attemptHostPool<T>(path, method, params, bodyStr, authToken);
+  let result = await attemptHostPool<T>(path, method, params, bodyStr, authToken, nigeriaIp, deviceId, gaid);
 
   // Absorb any rotated token immediately, regardless of whether this
   // particular call succeeded — keeps the cache current for next time.
   if (result.freshXUserToken && result.freshXUserToken !== authToken) {
-    await bootstrapAuthToken(env, async () => result.freshXUserToken).catch(() => {});
+    const finalDeviceId = deviceId || '';
+    const finalGaid = gaid || '';
+    await bootstrapAuthToken(env, finalDeviceId, finalGaid, async () => result.freshXUserToken).catch(() => {});
   }
 
   if (result.data !== null) {
@@ -287,14 +315,24 @@ export async function fetchWithHostPool<T>(
     console.warn(`[MovieBox] Auth failure on ${path} — invalidating token and retrying once`);
     await invalidateAuthToken(env);
 
+    deviceId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+    gaid = crypto.randomUUID();
+
     try {
-      authToken = await bootstrapAuthToken(env, async () => {
+      const finalDeviceId = deviceId;
+      const finalGaid = gaid;
+      authToken = await bootstrapAuthToken(env, finalDeviceId, finalGaid, async () => {
         const bootstrapResult = await attemptHostPool<unknown>(
           PATHS.tabOperating,
           'GET',
           { page: 1, tabId: 0, version: '' },
           null,
-          null
+          null,
+          nigeriaIp,
+          finalDeviceId,
+          finalGaid
         );
         return bootstrapResult.freshXUserToken;
       });
@@ -303,7 +341,7 @@ export async function fetchWithHostPool<T>(
       return null;
     }
 
-    result = await attemptHostPool<T>(path, method, params, bodyStr, authToken);
+    result = await attemptHostPool<T>(path, method, params, bodyStr, authToken, nigeriaIp, deviceId, gaid);
     return result.data;
   }
 

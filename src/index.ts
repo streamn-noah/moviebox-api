@@ -595,6 +595,19 @@ export default {
       return json({ status: 'ok', worker: 'moviebox-worker', ts: Date.now() });
     }
 
+    if (path === '/debug-sig' && request.method === 'GET') {
+      const ts = 1782346250180;
+      const method = 'GET';
+      const accept = 'application/json';
+      const contentType = 'application/json';
+      const url = 'https://api6.aoneroom.com/wefeed-mobile-bff/tab-operating?page=1&tabId=0&version=';
+      const body = null;
+      
+      const { generateSignature } = await import('./signing.js');
+      const sig = await generateSignature(method, accept, contentType, url, body, ts);
+      return json({ signature: sig });
+    }
+
     if (!isAuthorized(request, env)) {
       return err('Unauthorized', 401);
     }

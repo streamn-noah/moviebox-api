@@ -27,6 +27,8 @@
 // across requests — in-memory caching would mean every request re-bootstraps,
 // which both adds latency and risks tripping MovieBox's own rate limits.
 
+import nodeCrypto from 'node:crypto';
+
 const SECRET_KEY_B64 = '76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O';
 const SIGNATURE_BODY_MAX_BYTES = 102_400;
 
@@ -43,7 +45,7 @@ function b64Decode(value: string): Uint8Array {
   return bytes;
 }
 
-function b64Encode(buffer: ArrayBuffer): string {
+function b64Encode(buffer: ArrayBuffer | Uint8Array): string {
   const bytes = new Uint8Array(buffer);
   let binary = '';
   for (const byte of bytes) {
@@ -52,28 +54,20 @@ function b64Encode(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
-// ─── MD5 via SubtleCrypto ──────────────────────────────────────────────────────
-// SubtleCrypto supports MD5 in Cloudflare Workers (non-browser context)
+// ─── MD5 via node:crypto ──────────────────────────────────────────────────────
 
 async function md5Hex(data: string | Uint8Array): Promise<string> {
-  const bytes = typeof data === 'string' ? new TextEncoder().encode(data) : data;
-  const hashBuffer = await crypto.subtle.digest('MD5', bytes);
-  return Array.from(new Uint8Array(hashBuffer))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
+  const hash = nodeCrypto.createHash('md5');
+  hash.update(data);
+  return hash.digest('hex');
 }
 
-// ─── HMAC-MD5 ─────────────────────────────────────────────────────────────────
+// ─── HMAC-MD5 via node:crypto ─────────────────────────────────────────────────
 
-async function hmacMd5(keyBytes: Uint8Array, message: string): Promise<ArrayBuffer> {
-  const key = await crypto.subtle.importKey(
-    'raw',
-    keyBytes,
-    { name: 'HMAC', hash: 'MD5' },
-    false,
-    ['sign']
-  );
-  return crypto.subtle.sign('HMAC', key, new TextEncoder().encode(message));
+async function hmacMd5(keyBytes: Uint8Array, message: string): Promise<Uint8Array> {
+  const hmac = nodeCrypto.createHmac('md5', keyBytes);
+  hmac.update(message);
+  return hmac.digest();
 }
 
 // ─── Token & signature generators ─────────────────────────────────────────────
@@ -147,9 +141,12 @@ const KV_TOKEN_KEY = 'mobile_auth_token';
 const KV_TTL_SECONDS = 60 * 60 * 24; // 24h backstop, JWT itself is long-lived
 const EXPIRY_SAFETY_MARGIN_SECONDS = 300;
 
-interface CachedToken {
+export interface CachedToken {
   token: string;
   expiresAtSeconds: number;
+  deviceId?: string;
+  gaid?: string;
+  bootstrapIp?: string;
 }
 
 // Guards against duplicate concurrent bootstraps WITHIN a single isolate —
@@ -208,7 +205,10 @@ function isExpiringSoon(cached: CachedToken): boolean {
  */
 export async function bootstrapAuthToken(
   env: SigningEnv,
-  signedFetch: () => Promise<string | null>
+  deviceId: string,
+  gaid: string,
+  signedFetch: () => Promise<string | null>,
+  bootstrapIp?: string
 ): Promise<string> {
   if (!_bootstrapPromise) {
     _bootstrapPromise = (async () => {
@@ -220,7 +220,7 @@ export async function bootstrapAuthToken(
       const exp = decodeJwtExpSeconds(token);
       const expiresAtSeconds = exp ?? Math.floor(Date.now() / 1000) + 3600;
 
-      await writeTokenToKv(env.MOVIEBOX_SESSION_KV, { token, expiresAtSeconds });
+      await writeTokenToKv(env.MOVIEBOX_SESSION_KV, { token, expiresAtSeconds, deviceId, gaid, bootstrapIp });
 
       return token;
     })().finally(() => {
@@ -235,10 +235,10 @@ export async function bootstrapAuthToken(
  * Returns a valid cached auth token from KV, or null if none exists / it's
  * expiring soon and needs a fresh bootstrap.
  */
-export async function getCachedAuthToken(env: SigningEnv): Promise<string | null> {
+export async function getCachedAuthToken(env: SigningEnv): Promise<CachedToken | null> {
   const cached = await readTokenFromKv(env.MOVIEBOX_SESSION_KV);
   if (cached && !isExpiringSoon(cached)) {
-    return cached.token;
+    return cached;
   }
   return null;
 }
