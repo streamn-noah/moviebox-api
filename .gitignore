@@ -6,3 +6,4 @@ dist
 scratch/dist.js
 scratch/kv_store.json
 scratch/kv_val.json
+api/index.js

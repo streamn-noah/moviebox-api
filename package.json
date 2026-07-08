@@ -5,7 +5,7 @@
   "private": true,
   "scripts": {
     "dev": "npx esbuild src/index.ts --bundle --platform=node --outfile=scratch/dist.js --format=esm && node scratch/run_local.js",
-    "build": "npx esbuild src/index.ts --bundle --platform=node --outfile=scratch/dist.js --format=esm",
+    "build": "npx esbuild src/vercel_adapter.ts --bundle --platform=node --outfile=api/index.js --format=esm --external:undici",
     "deploy": "wrangler deploy",
     "cf-typegen": "wrangler types"
   },
