@@ -3,3 +3,6 @@ node_modules
 dist
 .env
 .dev.vars
+scratch/dist.js
+scratch/kv_store.json
+scratch/kv_val.json

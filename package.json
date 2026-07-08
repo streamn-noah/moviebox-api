@@ -5,8 +5,12 @@
   "private": true,
   "scripts": {
     "dev": "npx esbuild src/index.ts --bundle --platform=node --outfile=scratch/dist.js --format=esm && node scratch/run_local.js",
+    "build": "npx esbuild src/index.ts --bundle --platform=node --outfile=scratch/dist.js --format=esm",
     "deploy": "wrangler deploy",
     "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "undici": "^6.21.1"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260707.1",

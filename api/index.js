@@ -1,12 +1,10 @@
-// scratch/run_local.js
+// api/index.js
 import http from 'http';
 import fs from 'fs';
 import { setGlobalDispatcher, ProxyAgent } from 'undici';
-import worker from './dist.js';
+import worker from '../scratch/dist.js';
 
-const PORT = process.env.PORT || 8787;
-
-// Initialize Residential Proxy if PROXY_URL is set in environment (e.g. from .dev.vars or environment)
+// 1. Initialize Residential Proxy if PROXY_URL is set in environment
 if (process.env.PROXY_URL) {
   try {
     const proxyAgent = new ProxyAgent(process.env.PROXY_URL);
@@ -17,13 +15,16 @@ if (process.env.PROXY_URL) {
   }
 }
 
-// Mock KV Namespace using local JSON file
-const kvMock = {
+// 2. Vercel Memory + Disk KV cache fallback
+const vercelMemoryKV = {};
+const vercelKVMock = {
   async get(key) {
-    const storePath = './scratch/kv_store.json';
-    if (fs.existsSync(storePath)) {
+    if (vercelMemoryKV[key]) return vercelMemoryKV[key];
+    const path = '/tmp/vercel_kv_store.json';
+    if (fs.existsSync(path)) {
       try {
-        const db = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+        const db = JSON.parse(fs.readFileSync(path, 'utf8'));
+        vercelMemoryKV[key] = db[key] || null;
         return db[key] || null;
       } catch (e) {
         return null;
@@ -32,46 +33,51 @@ const kvMock = {
     return null;
   },
   async put(key, value) {
-    const storePath = './scratch/kv_store.json';
+    vercelMemoryKV[key] = value;
+    const path = '/tmp/vercel_kv_store.json';
     let db = {};
-    if (fs.existsSync(storePath)) {
+    if (fs.existsSync(path)) {
       try {
-        db = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+        db = JSON.parse(fs.readFileSync(path, 'utf8'));
       } catch (e) {}
     }
     db[key] = value;
-    fs.writeFileSync(storePath, JSON.stringify(db, null, 2), 'utf8');
+    try {
+      fs.writeFileSync(path, JSON.stringify(db, null, 2), 'utf8');
+    } catch (e) {}
   },
   async delete(key) {
-    const storePath = './scratch/kv_store.json';
-    if (fs.existsSync(storePath)) {
+    delete vercelMemoryKV[key];
+    const path = '/tmp/vercel_kv_store.json';
+    if (fs.existsSync(path)) {
       try {
-        const db = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+        const db = JSON.parse(fs.readFileSync(path, 'utf8'));
         delete db[key];
-        fs.writeFileSync(storePath, JSON.stringify(db, null, 2), 'utf8');
+        fs.writeFileSync(path, JSON.stringify(db, null, 2), 'utf8');
       } catch (e) {}
     }
   }
 };
 
 const env = {
-  MOVIEBOX_SESSION_KV: kvMock,
-  MOVIEBOX_SECRET: 'local-secret-12345',
-  NIGERIA_IP: '105.113.77.237'
+  MOVIEBOX_SESSION_KV: vercelKVMock,
+  MOVIEBOX_SECRET: process.env.MOVIEBOX_SECRET || 'local-secret-12345',
+  NIGERIA_IP: process.env.NIGERIA_IP || '197.210.65.1'
 };
 
-const server = http.createServer(async (req, res) => {
+// 3. Vercel Serverless Function entrypoint
+export default async function handler(req, res) {
   try {
-    // Read request body
+    // Read request body chunks
     const chunks = [];
     for await (const chunk of req) {
       chunks.push(chunk);
     }
     const body = Buffer.concat(chunks);
 
-    // Build Web API Request object
-    const protocol = req.socket.encrypted ? 'https' : 'http';
-    const host = req.headers.host || `localhost:${PORT}`;
+    // Build standard Web API Request object
+    const protocol = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http');
+    const host = req.headers.host || 'localhost';
     const url = `${protocol}://${host}${req.url}`;
     
     const headers = new Headers();
@@ -106,13 +112,8 @@ const server = http.createServer(async (req, res) => {
     const resBody = await webResponse.arrayBuffer();
     res.end(Buffer.from(resBody));
   } catch (err) {
-    console.error('Error handling request:', err);
+    console.error('Error handling serverless request:', err);
     res.statusCode = 500;
     res.end(JSON.stringify({ error: err.message }));
   }
-});
-
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`\n🚀 MovieBox API Local Node.js Server running at http://127.0.0.1:${PORT}`);
-  console.log(`   (Successfully bypassed Cloudflare workerd sandbox and TLS fingerprinting blocks!)\n`);
-});
+}
