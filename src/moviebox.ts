@@ -195,10 +195,16 @@ async function attemptHostPool<T>(
     try {
       const response = await fetch(urlStr, {
         method,
-        headers,
+        headers: {
+          ...headers,
+          'Cache-Control': 'no-cache, no-store, must-revalidate',
+          'Pragma': 'no-cache',
+          'Expires': '0',
+        },
         body: bodyStr ?? undefined,
         signal: AbortSignal.timeout(12000),
-      });
+        cache: 'no-store',
+      } as any);
 
       sawAnyResponse = true;
 

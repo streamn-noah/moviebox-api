@@ -281,9 +281,15 @@ async function attemptHostPool(path, method, params, bodyStr, authToken, nigeria
     try {
       const response = await fetch(urlStr, {
         method,
-        headers,
+        headers: {
+          ...headers,
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          "Pragma": "no-cache",
+          "Expires": "0"
+        },
         body: bodyStr ?? void 0,
-        signal: AbortSignal.timeout(12e3)
+        signal: AbortSignal.timeout(12e3),
+        cache: "no-store"
       });
       sawAnyResponse = true;
       const xUserToken = extractXUserToken(response);
