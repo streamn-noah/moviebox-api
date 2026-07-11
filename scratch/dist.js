@@ -405,6 +405,9 @@ function resolveSubjectType(subjectType) {
   if (subjectType === 7) return "shorts";
   return "movie";
 }
+function isNonEnglishDub(title) {
+  return /\[.*(hindi|tamil|telugu|malayalam|kannada|spanish|french|german|dub|latino|korean|japanese|arabic|urdu|bengali|portuguese|italian|russian|chinese|thai|indonesian|filipino).*\]/i.test(title);
+}
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -587,7 +590,7 @@ async function handleSearch(request, env) {
     { keyword, page, perPage, subjectType: 0 }
   );
   if (!data) return json({ items: [], pager: null });
-  const items = (data.items || []).filter((item) => ALLOWED_SUBJECT_TYPES.has(item.subjectType)).map((item) => ({
+  const items = (data.items || []).filter((item) => ALLOWED_SUBJECT_TYPES.has(item.subjectType)).filter((item) => !isNonEnglishDub(item.title)).map((item) => ({
     subjectId: item.subjectId,
     subjectType: item.subjectType,
     title: item.title,
@@ -757,7 +760,7 @@ async function handleHome(env) {
     opId: row.opId,
     type: row.type,
     total: (row.subjects || []).length,
-    subjects: (row.subjects || []).filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType)).map(normalizeH5Subject)
+    subjects: (row.subjects || []).filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType)).filter((s) => !isNonEnglishDub(s.title)).map(normalizeH5Subject)
   }));
   return json({ total: rows.length, rows });
 }
@@ -766,7 +769,7 @@ async function handleHomeSubjects(opId, env) {
   if (!data) return err("Failed to fetch homepage", 502);
   const row = (data.operatingList || []).find((r) => r.opId === opId);
   if (!row) return err("Row not found", 404);
-  const subjects = (row.subjects || []).filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType)).map(normalizeH5Subject);
+  const subjects = (row.subjects || []).filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType)).filter((s) => !isNonEnglishDub(s.title)).map(normalizeH5Subject);
   return json({
     opId: row.opId,
     title: row.title,

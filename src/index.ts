@@ -36,6 +36,10 @@ function resolveSubjectType(subjectType: number): 'movie' | 'tv' | 'shorts' {
   return 'movie';
 }
 
+function isNonEnglishDub(title: string): boolean {
+  return /\[.*(hindi|tamil|telugu|malayalam|kannada|spanish|french|german|dub|latino|korean|japanese|arabic|urdu|bengali|portuguese|italian|russian|chinese|thai|indonesian|filipino).*\]/i.test(title);
+}
+
 export interface Env extends SigningEnv {
   MOVIEBOX_SECRET: string;
   // Nigerian IP for X-Forwarded-For — ensures the H5 upstream returns the full
@@ -302,6 +306,7 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
 
   const items = (data.items || [])
     .filter((item) => ALLOWED_SUBJECT_TYPES.has(item.subjectType))
+    .filter((item) => !isNonEnglishDub(item.title))
     .map((item) => ({
       subjectId:   item.subjectId,
       subjectType: item.subjectType,
@@ -541,6 +546,7 @@ async function handleHome(env: Env): Promise<Response> {
     total:    (row.subjects || []).length,
     subjects: (row.subjects || [])
       .filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType))
+      .filter((s) => !isNonEnglishDub(s.title))
       .map(normalizeH5Subject),
   }));
 
@@ -559,6 +565,7 @@ async function handleHomeSubjects(opId: string, env: Env): Promise<Response> {
 
   const subjects = (row.subjects || [])
     .filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType))
+    .filter((s) => !isNonEnglishDub(s.title))
     .map(normalizeH5Subject);
 
   return json({
