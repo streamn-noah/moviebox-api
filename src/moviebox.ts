@@ -187,7 +187,7 @@ async function attemptHostPool<T>(
 
     const urlStr = url.toString();
     const headers = await buildHeaders(method, urlStr, bodyStr, authToken, deviceId, gaid);
-    if (nigeriaIp) {
+    if (nigeriaIp && !(env as any).fetch) {
       headers['X-Forwarded-For'] = nigeriaIp;
     }
     console.log(`[MovieBox Outgoing] URL: ${urlStr}`);
