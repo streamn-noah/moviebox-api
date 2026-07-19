@@ -163,6 +163,7 @@ function extractXUserToken(response: Response): string | null {
 }
 
 async function attemptHostPool<T>(
+  env: SigningEnv,
   path: string,
   method: 'GET' | 'POST',
   params: Record<string, string | number> | undefined,
@@ -193,7 +194,8 @@ async function attemptHostPool<T>(
     console.log(`[MovieBox Outgoing] Headers:`, JSON.stringify(headers));
 
     try {
-      const response = await fetch(urlStr, {
+      const activeFetch = (env as any).fetch || fetch;
+      const response = await activeFetch(urlStr, {
         method,
         headers: {
           ...headers,
@@ -286,6 +288,7 @@ export async function fetchWithHostPool<T>(
       const finalGaid = gaid;
       authToken = await bootstrapAuthToken(env, finalDeviceId, finalGaid, async () => {
         const result = await attemptHostPool<unknown>(
+          env,
           PATHS.tabOperating,
           'GET',
           { page: 1, tabId: 0, version: '' },
@@ -303,7 +306,7 @@ export async function fetchWithHostPool<T>(
     }
   }
 
-  let result = await attemptHostPool<T>(path, method, params, bodyStr, authToken, nigeriaIp, deviceId, gaid);
+  let result = await attemptHostPool<T>(env, path, method, params, bodyStr, authToken, nigeriaIp, deviceId, gaid);
 
   // Absorb any rotated token immediately, regardless of whether this
   // particular call succeeded — keeps the cache current for next time.
@@ -331,6 +334,7 @@ export async function fetchWithHostPool<T>(
       const finalGaid = gaid;
       authToken = await bootstrapAuthToken(env, finalDeviceId, finalGaid, async () => {
         const bootstrapResult = await attemptHostPool<unknown>(
+          env,
           PATHS.tabOperating,
           'GET',
           { page: 1, tabId: 0, version: '' },
@@ -347,7 +351,7 @@ export async function fetchWithHostPool<T>(
       return null;
     }
 
-    result = await attemptHostPool<T>(path, method, params, bodyStr, authToken, nigeriaIp, deviceId, gaid);
+    result = await attemptHostPool<T>(env, path, method, params, bodyStr, authToken, nigeriaIp, deviceId, gaid);
     return result.data;
   }
 

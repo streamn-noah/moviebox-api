@@ -169,7 +169,7 @@ var init_signing = __esm({
 
 // src/vercel_adapter.ts
 import fs from "node:fs";
-import { setGlobalDispatcher, ProxyAgent } from "undici";
+import { fetch as undiciFetch, setGlobalDispatcher, ProxyAgent } from "undici";
 
 // src/moviebox.ts
 init_signing();
@@ -264,7 +264,7 @@ function extractXUserToken(response) {
     return null;
   }
 }
-async function attemptHostPool(path, method, params, bodyStr, authToken, nigeriaIp, deviceId, gaid) {
+async function attemptHostPool(env2, path, method, params, bodyStr, authToken, nigeriaIp, deviceId, gaid) {
   let freshXUserToken = null;
   let sawAuthFailure = false;
   let sawAnyResponse = false;
@@ -283,7 +283,8 @@ async function attemptHostPool(path, method, params, bodyStr, authToken, nigeria
     console.log(`[MovieBox Outgoing] URL: ${urlStr}`);
     console.log(`[MovieBox Outgoing] Headers:`, JSON.stringify(headers));
     try {
-      const response = await fetch(urlStr, {
+      const activeFetch = env2.fetch || fetch;
+      const response = await activeFetch(urlStr, {
         method,
         headers: {
           ...headers,
@@ -345,6 +346,7 @@ async function fetchWithHostPool(env2, path, method, params, body) {
       const finalGaid = gaid;
       authToken = await bootstrapAuthToken(env2, finalDeviceId, finalGaid, async () => {
         const result2 = await attemptHostPool(
+          env2,
           PATHS.tabOperating,
           "GET",
           { page: 1, tabId: 0, version: "" },
@@ -361,7 +363,7 @@ async function fetchWithHostPool(env2, path, method, params, body) {
       return null;
     }
   }
-  let result = await attemptHostPool(path, method, params, bodyStr, authToken, nigeriaIp, deviceId, gaid);
+  let result = await attemptHostPool(env2, path, method, params, bodyStr, authToken, nigeriaIp, deviceId, gaid);
   if (result.freshXUserToken && result.freshXUserToken !== authToken) {
     const finalDeviceId = deviceId || "";
     const finalGaid = gaid || "";
@@ -381,6 +383,7 @@ async function fetchWithHostPool(env2, path, method, params, body) {
       const finalGaid = gaid;
       authToken = await bootstrapAuthToken(env2, finalDeviceId, finalGaid, async () => {
         const bootstrapResult = await attemptHostPool(
+          env2,
           PATHS.tabOperating,
           "GET",
           { page: 1, tabId: 0, version: "" },
@@ -396,7 +399,7 @@ async function fetchWithHostPool(env2, path, method, params, body) {
       console.error(`[MovieBox] Re-bootstrap after auth failure failed: ${e}`);
       return null;
     }
-    result = await attemptHostPool(path, method, params, bodyStr, authToken, nigeriaIp, deviceId, gaid);
+    result = await attemptHostPool(env2, path, method, params, bodyStr, authToken, nigeriaIp, deviceId, gaid);
     return result.data;
   }
   return null;
@@ -909,7 +912,8 @@ var kvMock = {
 var env = {
   MOVIEBOX_SESSION_KV: kvMock,
   MOVIEBOX_SECRET: process.env.MOVIEBOX_SECRET ?? "local-secret-12345",
-  NIGERIA_IP: process.env.NIGERIA_IP ?? "197.210.65.1"
+  NIGERIA_IP: process.env.NIGERIA_IP ?? "197.210.65.1",
+  fetch: process.env.PROXY_URL ? undiciFetch : fetch
 };
 async function handler(req, res) {
   try {

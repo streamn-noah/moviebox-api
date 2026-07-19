@@ -3,7 +3,7 @@
 // with a residential proxy dispatcher and a /tmp-backed KV mock.
 import fs from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { setGlobalDispatcher, ProxyAgent } from 'undici';
+import { fetch as undiciFetch, setGlobalDispatcher, ProxyAgent } from 'undici';
 import worker from './index';
 
 // ─── Residential Proxy ────────────────────────────────────────────────────────
@@ -57,6 +57,7 @@ const env = {
   MOVIEBOX_SESSION_KV: kvMock,
   MOVIEBOX_SECRET: process.env.MOVIEBOX_SECRET ?? 'local-secret-12345',
   NIGERIA_IP:       process.env.NIGERIA_IP       ?? '197.210.65.1',
+  fetch:            process.env.PROXY_URL        ? undiciFetch : fetch,
 };
 
 // ─── Vercel handler ───────────────────────────────────────────────────────────
