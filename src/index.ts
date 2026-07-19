@@ -90,35 +90,46 @@ const LANGUAGE_NAMES: Record<string, string> = {
 
 const RESOLUTIONS = [360, 480, 720, 1080];
 
-async function fetchResourcePack(env: Env, subjectId: string): Promise<MBResourceItem[] | null> {
+async function fetchResourcePack(
+  env: Env,
+  subjectId: string,
+  se = 0,
+  ep = 0
+): Promise<MBResourceItem[] | null> {
   const seenResourceIds = new Set<string>();
   const allItems: MBResourceItem[] = [];
   const perPage = 10;
 
-  for (const resolution of RESOLUTIONS) {
+  const promises = RESOLUTIONS.map(async (resolution) => {
     let page = 1;
-
+    const resItems: MBResourceItem[] = [];
     while (true) {
       const data = await fetchWithHostPool<MBResourceData>(
-        env, PATHS.resource, 'GET', { subjectId, se: 0, ep: 0, resolution, page, perPage }
+        env, PATHS.resource, 'GET', { subjectId, se, ep, resolution, page, perPage }
       );
 
       if (!data?.list?.length) break;
 
       for (const item of data.list) {
-        if (!seenResourceIds.has(item.resourceId)) {
-          seenResourceIds.add(item.resourceId);
-          allItems.push(item);
-        }
+        resItems.push(item);
       }
 
       if (!data.pager?.hasMore) break;
 
       page++;
 
-      // Safety cap — 100 pages x 10 items = 1000 items per resolution,
-      // enough for the longest series on MovieBox (e.g. One Piece ~1100 eps).
       if (page > 100) break;
+    }
+    return resItems;
+  });
+
+  const results = await Promise.all(promises);
+  for (const resItems of results) {
+    for (const item of resItems) {
+      if (!seenResourceIds.has(item.resourceId)) {
+        seenResourceIds.add(item.resourceId);
+        allItems.push(item);
+      }
     }
   }
 
@@ -406,7 +417,7 @@ async function handleSeason(subjectId: string, env: Env): Promise<Response> {
 // Use se=0&ep=0 for movies (returns full pack as one item per quality).
 
 async function handleStream(subjectId: string, se: number, ep: number, env: Env): Promise<Response> {
-  const pack = await fetchResourcePack(env, subjectId);
+  const pack = await fetchResourcePack(env, subjectId, se, ep);
   if (!pack) return err('No streams available', 404);
 
   const isMovie = se === 0 && ep === 0;

@@ -446,29 +446,37 @@ var LANGUAGE_NAMES = {
   id: "Indonesian"
 };
 var RESOLUTIONS = [360, 480, 720, 1080];
-async function fetchResourcePack(env, subjectId) {
+async function fetchResourcePack(env, subjectId, se = 0, ep = 0) {
   const seenResourceIds = /* @__PURE__ */ new Set();
   const allItems = [];
   const perPage = 10;
-  for (const resolution of RESOLUTIONS) {
+  const promises = RESOLUTIONS.map(async (resolution) => {
     let page = 1;
+    const resItems = [];
     while (true) {
       const data = await fetchWithHostPool(
         env,
         PATHS.resource,
         "GET",
-        { subjectId, se: 0, ep: 0, resolution, page, perPage }
+        { subjectId, se, ep, resolution, page, perPage }
       );
       if (!data?.list?.length) break;
       for (const item of data.list) {
-        if (!seenResourceIds.has(item.resourceId)) {
-          seenResourceIds.add(item.resourceId);
-          allItems.push(item);
-        }
+        resItems.push(item);
       }
       if (!data.pager?.hasMore) break;
       page++;
       if (page > 100) break;
+    }
+    return resItems;
+  });
+  const results = await Promise.all(promises);
+  for (const resItems of results) {
+    for (const item of resItems) {
+      if (!seenResourceIds.has(item.resourceId)) {
+        seenResourceIds.add(item.resourceId);
+        allItems.push(item);
+      }
     }
   }
   if (!allItems.length) return null;
@@ -674,7 +682,7 @@ async function handleSeason(subjectId, env) {
   });
 }
 async function handleStream(subjectId, se, ep, env) {
-  const pack = await fetchResourcePack(env, subjectId);
+  const pack = await fetchResourcePack(env, subjectId, se, ep);
   if (!pack) return err("No streams available", 404);
   const isMovie = se === 0 && ep === 0;
   let items = pack;

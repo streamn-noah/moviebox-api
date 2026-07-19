@@ -409,6 +409,9 @@ function resolveSubjectType(subjectType) {
   if (subjectType === 7) return "shorts";
   return "movie";
 }
+function isNonEnglishDub(title) {
+  return /\[.*(hindi|tamil|telugu|malayalam|kannada|spanish|french|german|dub|latino|korean|japanese|arabic|urdu|bengali|portuguese|italian|russian|chinese|thai|indonesian|filipino).*\]/i.test(title);
+}
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -447,29 +450,37 @@ var LANGUAGE_NAMES = {
   id: "Indonesian"
 };
 var RESOLUTIONS = [360, 480, 720, 1080];
-async function fetchResourcePack(env2, subjectId) {
+async function fetchResourcePack(env2, subjectId, se = 0, ep = 0) {
   const seenResourceIds = /* @__PURE__ */ new Set();
   const allItems = [];
   const perPage = 10;
-  for (const resolution of RESOLUTIONS) {
+  const promises = RESOLUTIONS.map(async (resolution) => {
     let page = 1;
+    const resItems = [];
     while (true) {
       const data = await fetchWithHostPool(
         env2,
         PATHS.resource,
         "GET",
-        { subjectId, se: 0, ep: 0, resolution, page, perPage }
+        { subjectId, se, ep, resolution, page, perPage }
       );
       if (!data?.list?.length) break;
       for (const item of data.list) {
-        if (!seenResourceIds.has(item.resourceId)) {
-          seenResourceIds.add(item.resourceId);
-          allItems.push(item);
-        }
+        resItems.push(item);
       }
       if (!data.pager?.hasMore) break;
       page++;
       if (page > 100) break;
+    }
+    return resItems;
+  });
+  const results = await Promise.all(promises);
+  for (const resItems of results) {
+    for (const item of resItems) {
+      if (!seenResourceIds.has(item.resourceId)) {
+        seenResourceIds.add(item.resourceId);
+        allItems.push(item);
+      }
     }
   }
   if (!allItems.length) return null;
@@ -591,7 +602,7 @@ async function handleSearch(request, env2) {
     { keyword, page, perPage, subjectType: 0 }
   );
   if (!data) return json({ items: [], pager: null });
-  const items = (data.items || []).filter((item) => ALLOWED_SUBJECT_TYPES.has(item.subjectType)).map((item) => ({
+  const items = (data.items || []).filter((item) => ALLOWED_SUBJECT_TYPES.has(item.subjectType)).filter((item) => !isNonEnglishDub(item.title)).map((item) => ({
     subjectId: item.subjectId,
     subjectType: item.subjectType,
     title: item.title,
@@ -675,7 +686,7 @@ async function handleSeason(subjectId, env2) {
   });
 }
 async function handleStream(subjectId, se, ep, env2) {
-  const pack = await fetchResourcePack(env2, subjectId);
+  const pack = await fetchResourcePack(env2, subjectId, se, ep);
   if (!pack) return err("No streams available", 404);
   const isMovie = se === 0 && ep === 0;
   let items = pack;
@@ -761,7 +772,7 @@ async function handleHome(env2) {
     opId: row.opId,
     type: row.type,
     total: (row.subjects || []).length,
-    subjects: (row.subjects || []).filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType)).map(normalizeH5Subject)
+    subjects: (row.subjects || []).filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType)).filter((s) => !isNonEnglishDub(s.title)).map(normalizeH5Subject)
   }));
   return json({ total: rows.length, rows });
 }
@@ -770,7 +781,7 @@ async function handleHomeSubjects(opId, env2) {
   if (!data) return err("Failed to fetch homepage", 502);
   const row = (data.operatingList || []).find((r) => r.opId === opId);
   if (!row) return err("Row not found", 404);
-  const subjects = (row.subjects || []).filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType)).map(normalizeH5Subject);
+  const subjects = (row.subjects || []).filter((s) => ALLOWED_SUBJECT_TYPES.has(s.subjectType)).filter((s) => !isNonEnglishDub(s.title)).map(normalizeH5Subject);
   return json({
     opId: row.opId,
     title: row.title,
