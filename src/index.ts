@@ -36,8 +36,23 @@ function resolveSubjectType(subjectType: number): 'movie' | 'tv' | 'shorts' {
   return 'movie';
 }
 
-function isNonEnglishDub(title: string): boolean {
-  return /\[.*(hindi|tamil|telugu|malayalam|kannada|spanish|french|german|dub|latino|korean|japanese|arabic|urdu|bengali|portuguese|italian|russian|chinese|thai|indonesian|filipino).*\]/i.test(title);
+function isNonEnglishDub(title: string, language?: string | null): boolean {
+  const haystack = `${title} ${language ?? ''}`;
+  const bracketDubPattern =
+    /[\[(].*?\b(hindi|tamil|telugu|malayalam|kannada|bengali|punjabi|urdu|spanish|espanol|latino|french|german|italian|korean|japanese|arabic|portuguese|russian|chinese|thai|indonesian|filipino|dub|dubbed|dual-audio|multi-audio)\b.*?[\])]/i;
+
+  if (bracketDubPattern.test(haystack)) {
+    return true;
+  }
+
+  const wordDubPattern =
+    /\b(hindi|tamil|telugu|malayalam|kannada|bengali|punjabi|urdu|dubbed|dual-audio|multi-audio)\b/i;
+
+  if (wordDubPattern.test(haystack)) {
+    return true;
+  }
+
+  return false;
 }
 
 export interface Env extends SigningEnv {
@@ -317,7 +332,7 @@ async function handleSearch(request: Request, env: Env): Promise<Response> {
 
   const items = (data.items || [])
     .filter((item) => ALLOWED_SUBJECT_TYPES.has(item.subjectType))
-    .filter((item) => !isNonEnglishDub(item.title))
+    .filter((item) => !isNonEnglishDub(item.title, item.language))
     .map((item) => ({
       subjectId:   item.subjectId,
       subjectType: item.subjectType,
